@@ -1,0 +1,17 @@
+# Specific files to ignore
+instructions.txt
+
+# Directories to ignore
+robertson_data_cache/
+
+# Python artifacts (Standard ignores)
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.DS_Store
+
+# Training Logs and Outputs
+runs_robertson/
+*.csv
+*.npz
