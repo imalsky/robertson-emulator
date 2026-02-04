@@ -1,0 +1,1 @@
+robertson_data_cache/robertson_traj10000_steps200_dt0.1-10_seed0_y0rand_k0.04-10000-3e+07_rtol1e-07_atol1e-10_dt01e-12.npz

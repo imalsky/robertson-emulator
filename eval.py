@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-Evaluation for Robertson emulators.
+eval.py
 
-What this script does (per your request):
-- For EACH model (MLP, DeepONet):
-    1) Pick 1 random test trajectory ("profile").
-    2) Pick a random starting index inside that trajectory.
-    3) Run 100-step autoregressive rollout starting from that point using the TRUE dt sequence.
-    4) Plot the ENTIRE ground-truth trajectory, and superimpose ONLY the model predictions.
+Minimal evaluation/visualization for Robertson flow-map emulators (Residual MLP + DeepONet)
+trained by train_robertson.py.
 
-Output:
-  runs_robertson/<run_name>/plots/
-    overlay_fulltraj_ar_<ckpt>.png
+This script does ONLY:
+- Use the TEST split only.
+- Pick ONE random test trajectory.
+- Autoregressive rollout over the full trajectory using the true per-step Δt sequence.
+- Save TWO figures:
+    1) True vs MLP (predicted points shown as square markers at each jump)
+    2) True vs DeepONet (predicted points shown as square markers at each jump)
+  Both figures are log-log (time vs concentration), and use *denormalized physical concentrations*.
 
-Notes:
-- MLP predicts normalized Δlog10(y) (residual in log-space).
-- DeepONet predicts normalized log10(y_next).
-- Conditioning always uses y0 (3) and k (3) from the trajectory metadata.
-- Rollout is JIT-compiled; random selection + slicing happens in Python to keep indices static.
-- No argparse: edit EvalConfig below.
+It also prints summary stats for the selected trajectory's Δt sequence (min/median/max and a short prefix).
 """
 
 from __future__ import annotations
@@ -28,83 +24,83 @@ import pickle
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, Mapping, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-import matplotlib.pyplot as plt
-
+plt.style.use('science.mplstyle')
 
 # -----------------------------
 # CONFIG (edit here)
 # -----------------------------
 @dataclass(frozen=True)
 class EvalConfig:
-    log_dir: str = "runs_robertson"
-    run_name: str = "baseline_v2"
+    log_dir: str = "runs"
+    run_name: str = "baseline"
     ckpt: str = "best"  # "best" or "last"
-
-    # Autoregressive overlay
-    ar_steps: int = 100
-    same_profile_for_models: bool = True  # if True, both models use the same random profile + start index
-
-    # Randomness
+    eval_device: str = "auto"  # "auto" | "cpu" | "gpu"
     seed: int = 0
+    out_dirname: str = "plots"
 
-    # Plot settings
-    eps_plot: float = 1e-30  # for semilogy
-    out_png_name: str = "overlay_fulltraj_ar"
+    # Base name; script will append _mlp.png and _deeponet.png
+    out_png_stem: str = "test_traj_loglog"
 
 
 EVAL = EvalConfig()
 
-# x64 helps on some numerics; model compute stays float32.
-jax.config.update("jax_enable_x64", True)
+
+# -----------------------------
+# Device selection
+# -----------------------------
+def _prefer_gpu_device() -> jax.Device:
+    try:
+        gpus = jax.devices("gpu")
+        if gpus:
+            return gpus[0]
+    except RuntimeError:
+        pass
+    return jax.devices("cpu")[0]
+
+
+def _select_device(kind: str) -> jax.Device:
+    kind_l = kind.lower().strip()
+    if kind_l == "auto":
+        return _prefer_gpu_device()
+    if kind_l == "cpu":
+        return jax.devices("cpu")[0]
+    if kind_l == "gpu":
+        gpus = jax.devices("gpu")
+        if not gpus:
+            raise RuntimeError("eval_device='gpu' requested but no GPU devices found.")
+        return gpus[0]
+    raise ValueError(f"Unknown device kind: {kind!r}")
 
 
 # -----------------------------
-# Plot defaults
-# -----------------------------
-def set_plot_style() -> None:
-    plt.rcParams.update(
-        {
-            "figure.dpi": 120,
-            "savefig.dpi": 220,
-            "font.size": 12,
-            "axes.grid": True,
-            "grid.alpha": 0.25,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-            "legend.frameon": False,
-            "lines.linewidth": 2.2,
-        }
-    )
-
-
-# -----------------------------
-# Shared model code (must match training)
+# Shared model code (must match train_robertson.py)
 # -----------------------------
 def get_activation(name: str) -> Callable[[jnp.ndarray], jnp.ndarray]:
-    name = name.lower()
-    if name == "relu":
+    name_l = name.lower()
+    if name_l == "relu":
         return jax.nn.relu
-    if name == "swish":
+    if name_l == "swish":
         return jax.nn.silu
-    if name == "gelu":
+    if name_l == "gelu":
         return jax.nn.gelu
-    if name == "tanh":
+    if name_l == "tanh":
         return jnp.tanh
-    if name == "elu":
+    if name_l == "elu":
         return jax.nn.elu
     raise ValueError(f"Unknown activation: {name}")
 
 
 def mlp_apply(
-    params: List[Dict[str, jax.Array]],
+    params: Any,  # List[Dict[str, jax.Array]]
     x: jnp.ndarray,
     act: Callable[[jnp.ndarray], jnp.ndarray],
 ) -> jnp.ndarray:
@@ -116,7 +112,7 @@ def mlp_apply(
 
 
 def deeponet_apply(
-    params: Dict[str, object],
+    params: Any,  # Dict[str, Any]
     x_branch: jnp.ndarray,
     x_trunk: jnp.ndarray,
     act: Callable[[jnp.ndarray], jnp.ndarray],
@@ -128,291 +124,340 @@ def deeponet_apply(
     return h @ head["W"] + head["b"]
 
 
-def forward_apply(model_type: str, params, batch: Dict[str, jnp.ndarray], act) -> jnp.ndarray:
-    if model_type == "mlp":
-        return mlp_apply(params, batch["x"], act)
-    if model_type == "deeponet":
-        return deeponet_apply(params, batch["x_branch"], batch["x_trunk"], act)
-    raise ValueError(f"Unknown model_type: {model_type}")
-
-
-def load_params(path: Path):
-    with open(path, "rb") as f:
-        params_np = pickle.load(f)
-    return jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), params_np)
-
-
+# -----------------------------
+# IO helpers
+# -----------------------------
 def load_npz(path: Path) -> Dict[str, np.ndarray]:
     z = np.load(path, allow_pickle=False)
     return {k: z[k] for k in z.files}
 
 
-def load_norm_stats(path: Path) -> Dict[str, jnp.ndarray]:
+def load_params(path: Path, device: jax.Device) -> Any:
+    with open(path, "rb") as f:
+        params_np = pickle.load(f)
+    params = jax.tree_util.tree_map(lambda x: jnp.asarray(x, dtype=jnp.float32), params_np)
+    return jax.device_put(params, device=device)
+
+
+def load_norm_stats(path: Path, device: jax.Device) -> Dict[str, jnp.ndarray]:
     raw = load_npz(path)
-    norm = {k: jnp.asarray(v, dtype=jnp.float32) for k, v in raw.items()}
-    norm["eps"] = jnp.asarray(float(raw["eps"]), dtype=jnp.float32)
-    norm["min_std"] = jnp.asarray(float(raw["min_std"]), dtype=jnp.float32)
+    norm: Dict[str, jnp.ndarray] = {}
+    for k, v in raw.items():
+        if k in ("eps", "min_std"):
+            norm[k] = jax.device_put(jnp.asarray(float(v), dtype=jnp.float32), device=device)
+        else:
+            norm[k] = jax.device_put(jnp.asarray(v, dtype=jnp.float32), device=device)
     return norm
 
 
-def log10_safe(x: jnp.ndarray, eps: jnp.ndarray) -> jnp.ndarray:
-    return jnp.log10(x + eps)
+def _resolve_dataset_path(run_dir: Path) -> Path:
+    p_txt = run_dir / "dataset_path.txt"
+    stored = Path(p_txt.read_text().strip())
 
+    if stored.exists():
+        return stored
 
-def encode_inputs(
-    y_t_phys: jnp.ndarray,   # [3] or [B,3]
-    dt_phys: jnp.ndarray,    # [1] or [B,1]
-    y0_phys: jnp.ndarray,    # [3] or [B,3]
-    k_phys: jnp.ndarray,     # [3] or [B,3]
-    norm: Dict[str, jnp.ndarray],
-    model_type: str,
-) -> Dict[str, jnp.ndarray]:
-    eps = norm["eps"]
-    min_std = norm["min_std"]
+    cand = (run_dir / stored).resolve()
+    if cand.exists():
+        return cand
 
-    logy_t = log10_safe(y_t_phys, eps)
-    logdt = jnp.log10(dt_phys)
-    logy0 = log10_safe(y0_phys, eps)
-    logk = jnp.log10(k_phys)
+    name = stored.name
+    candidates = [
+        run_dir.parent.parent / "robertson_data_cache" / name,
+        run_dir.parent / "robertson_data_cache" / name,
+        Path("robertson_data_cache") / name,
+        run_dir / name,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
 
-    x_state = (logy_t - norm["state_mean"]) / jnp.clip(norm["state_std"], min_std, jnp.inf)
-    x_dt = (logdt - norm["dt_mean"]) / jnp.clip(norm["dt_std"], min_std, jnp.inf)
-    x_y0 = (logy0 - norm["y0_mean"]) / jnp.clip(norm["y0_std"], min_std, jnp.inf)
-    x_k = (logk - norm["k_mean"]) / jnp.clip(norm["k_std"], min_std, jnp.inf)
-
-    if model_type == "mlp":
-        x = jnp.concatenate([x_state, x_dt, x_y0, x_k], axis=-1)  # [...,10]
-        return {"x": x}
-
-    if model_type == "deeponet":
-        x_branch = jnp.concatenate([x_y0, x_k], axis=-1)          # [...,6]
-        x_trunk = jnp.concatenate([x_state, x_dt], axis=-1)       # [...,4]
-        return {"x_branch": x_branch, "x_trunk": x_trunk}
-
-    raise ValueError(f"Unknown model_type: {model_type}")
-
-
-def decode_to_next_y_phys(
-    model_type: str,
-    pred_out_norm: jnp.ndarray,   # [3] or [B,3]
-    y_curr_phys: jnp.ndarray,     # [3] or [B,3]
-    norm: Dict[str, jnp.ndarray],
-) -> jnp.ndarray:
-    eps = norm["eps"]
-    min_std = norm["min_std"]
-
-    if model_type == "deeponet":
-        logy_next = pred_out_norm * jnp.clip(norm["out_std_deeponet"], min_std, jnp.inf) + norm["out_mean_deeponet"]
-    elif model_type == "mlp":
-        logy_curr = log10_safe(y_curr_phys, eps)
-        dlog = pred_out_norm * jnp.clip(norm["out_std_mlp"], min_std, jnp.inf) + norm["out_mean_mlp"]
-        logy_next = logy_curr + dlog
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-    y_next = jnp.power(10.0, logy_next) - eps
-    y_next = jnp.clip(y_next, 0.0, jnp.inf)
-    y_next = y_next / jnp.clip(jnp.sum(y_next, axis=-1, keepdims=True), 1e-30, jnp.inf)
-    return y_next
+    return stored
 
 
 # -----------------------------
-# JIT-compiled single-trajectory rollout
+# Time grid inference (robust)
 # -----------------------------
-@partial(jax.jit, static_argnames=("model_type", "act_name"))
-def rollout_from_point_jit(
-    model_type: str,
-    params,
+def infer_time_and_dts(dts_or_t: np.ndarray, y_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      t_abs: shape [y_len] strictly increasing, with t_abs[0] possibly 0
+      dts:   shape [y_len-1] positive step sizes (Δt)
+
+    Supports two dataset conventions:
+      A) stored per-step Δt (length y_len-1)
+      B) stored absolute time points (length y_len)  (rare, but support defensively)
+    """
+    v = np.asarray(dts_or_t, dtype=np.float64).reshape(-1)
+    if v.size == y_len - 1:
+        dts = v
+        if np.any(dts <= 0.0):
+            raise ValueError("Found non-positive Δt in test trajectory.")
+        t_abs = np.concatenate([[0.0], np.cumsum(dts)])
+        return t_abs, dts
+
+    if v.size == y_len:
+        t_abs = v
+        if np.any(np.diff(t_abs) <= 0.0):
+            raise ValueError("Stored time points are not strictly increasing.")
+        dts = np.diff(t_abs)
+        if np.any(dts <= 0.0):
+            raise ValueError("Derived Δt contains non-positive values.")
+        return t_abs, dts
+
+    raise ValueError(f"Cannot infer time grid: got {v.size} values, but y_len={y_len}.")
+
+
+def make_log_time(t_abs: np.ndarray) -> np.ndarray:
+    """
+    For log-x plotting: replace any non-positive entries with a small positive value
+    based on the smallest positive time in the trajectory (not a fixed 1e-300).
+    """
+    t = np.asarray(t_abs, dtype=np.float64).copy()
+    pos = t[t > 0.0]
+    if pos.size == 0:
+        raise ValueError("All times are non-positive; cannot log-plot.")
+    t0 = float(pos.min() * 0.5)
+    t[t <= 0.0] = t0
+    return t
+
+
+# -----------------------------
+# Numerics helpers
+# -----------------------------
+def _zscore(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, min_std: jnp.ndarray) -> jnp.ndarray:
+    return (x - mean) / jnp.clip(std, min_std, jnp.inf)
+
+
+def _log10_safe(y: jnp.ndarray, eps: jnp.ndarray) -> jnp.ndarray:
+    return jnp.log10(y + eps)
+
+
+def _logy_to_y_simplex(logy: jnp.ndarray, eps: jnp.ndarray) -> jnp.ndarray:
+    y = jnp.power(10.0, logy) - eps
+    y = jnp.clip(y, 0.0, jnp.inf)
+    y = y / jnp.clip(jnp.sum(y, axis=-1, keepdims=True), 1e-30, jnp.inf)
+    return y
+
+
+# -----------------------------
+# JIT-compiled rollouts (act_name is static)
+# -----------------------------
+@partial(jax.jit, static_argnames=("act_name",))
+def rollout_mlp_full(
+    params: Any,
     act_name: str,
-    norm: Dict[str, jnp.ndarray],
-    y_start: jnp.ndarray,   # [3]
-    dt_seq: jnp.ndarray,    # [K,1]
-    y0_const: jnp.ndarray,  # [3]
-    k_const: jnp.ndarray,   # [3]
+    norm: Mapping[str, jnp.ndarray],
+    y0: jnp.ndarray,      # [3] physical
+    dts: jnp.ndarray,     # [T] physical
 ) -> jnp.ndarray:
-    """
-    Returns ys_pred including the start state: [K+1, 3]
-    """
     act = get_activation(act_name)
+    eps = norm["eps"]
+    min_std = norm["min_std"]
 
-    def step_fn(y_curr, dt_step):
-        batch = encode_inputs(
-            y_t_phys=y_curr[None, :],
-            dt_phys=dt_step[None, :],
-            y0_phys=y0_const[None, :],
-            k_phys=k_const[None, :],
-            norm=norm,
-            model_type=model_type,
-        )
-        pred_out = forward_apply(model_type, params, batch, act)[0]  # [3]
-        y_next = decode_to_next_y_phys(model_type, pred_out, y_curr, norm)
-        return y_next, y_next
+    logy0 = _log10_safe(y0, eps)
+    logdt = jnp.log10(dts)
 
-    _, ys_next = lax.scan(step_fn, y_start, dt_seq)
-    return jnp.concatenate([y_start[None, :], ys_next], axis=0)
+    def step_fn(logy_curr: jnp.ndarray, logdt_step: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        x_state = _zscore(logy_curr, norm["state_mean"], norm["state_std"], min_std)
+        x_dt = _zscore(logdt_step[None], norm["dt_mean"], norm["dt_std"], min_std)
+        x = jnp.concatenate([x_state, x_dt], axis=-1)[None, :]
+
+        pred_norm = mlp_apply(params, x, act)[0]  # normalized Δlog
+        dlog = pred_norm * jnp.clip(norm["out_std_mlp"], min_std, jnp.inf) + norm["out_mean_mlp"]
+        logy_next = logy_curr + dlog
+        y_next = _logy_to_y_simplex(logy_next[None, :], eps)[0]
+        return logy_next, y_next
+
+    _, ys_next = lax.scan(step_fn, logy0, logdt)
+    return jnp.concatenate([y0[None, :], ys_next], axis=0)
+
+
+@partial(jax.jit, static_argnames=("act_name",))
+def rollout_deeponet_full(
+    params: Any,
+    act_name: str,
+    norm: Mapping[str, jnp.ndarray],
+    y0: jnp.ndarray,      # [3] physical
+    dts: jnp.ndarray,     # [T] physical
+) -> jnp.ndarray:
+    act = get_activation(act_name)
+    eps = norm["eps"]
+    min_std = norm["min_std"]
+
+    logy0 = _log10_safe(y0, eps)
+    logdt = jnp.log10(dts)
+
+    def step_fn(logy_curr: jnp.ndarray, logdt_step: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        x_state = _zscore(logy_curr, norm["state_mean"], norm["state_std"], min_std)
+        x_dt = _zscore(logdt_step[None], norm["dt_mean"], norm["dt_std"], min_std)
+
+        pred_norm = deeponet_apply(params, x_state[None, :], x_dt[None, :], act)[0]
+        logy_next = pred_norm * jnp.clip(norm["out_std_deeponet"], min_std, jnp.inf) + norm["out_mean_deeponet"]
+
+        y_next = _logy_to_y_simplex(logy_next[None, :], eps)[0]
+        return logy_next, y_next
+
+    _, ys_next = lax.scan(step_fn, logy0, logdt)
+    return jnp.concatenate([y0[None, :], ys_next], axis=0)
 
 
 # -----------------------------
-# Plot: full GT + overlay AR
+# Plotting
 # -----------------------------
-def plot_fulltraj_overlay(
+def _plot_one_model(
+    t_log: np.ndarray,          # [T+1], positive
+    y_true: np.ndarray,         # [T+1,3], physical
+    y_pred: np.ndarray,         # [T+1,3], physical
     out_png: Path,
-    gt_time: np.ndarray,         # [T] (includes 0)
-    gt_y: np.ndarray,            # [T,3]
-    start_t: float,              # scalar time where rollout begins
-    pred_time: np.ndarray,       # [K] times corresponding to predicted points (t_{start+1..start+K})
-    pred_y: np.ndarray,          # [K,3] predicted y at those times
-    model_label: str,
+    title: str,
     eps_plot: float,
-    ax: plt.Axes,
 ) -> None:
-    names = ["y1", "y2", "y3"]
-    # Avoid t=0 on log-x.
-    x_gt = gt_time[1:]
-    y_gt = gt_y[1:, :]
+    fig, axes = plt.subplots(3, 1, figsize=(7.0, 7.5), sharex=True)
 
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+    labels = ["y1", "y2", "y3"]
+    for i, ax in enumerate(axes):
+        # True: continuous line
+        ax.loglog(t_log, y_true[:, i] + eps_plot, "-", label="True")
 
-    # GT lines
-    for s in range(3):
-        ax.plot(x_gt, y_gt[:, s] + eps_plot, label=f"GT {names[s]}")
-
-    # Overlay predictions as markers (unlabeled)
-    for s in range(3):
-        ax.scatter(
-            pred_time,
-            pred_y[:, s] + eps_plot,
-            s=26,
-            alpha=0.95,
-            marker="o",
-            linewidths=0.6,
-            edgecolors="black",
-            zorder=5,
+        # Pred: show exact jump values with square markers (and a faint connecting line for readability)
+        ax.loglog(
+            t_log,
+            y_pred[:, i] + eps_plot,
+            "-",
+            marker="s",
+            markersize=3.0,
+            linewidth=0.8,
+            label="Pred",
         )
 
-    # Mark start time
-    ax.axvline(start_t, linestyle="--", linewidth=1.2)
-    ax.set_title(model_label)
-    ax.set_xlabel("time (cumulative dt)")
-    ax.set_ylabel("mixing ratio")
+        ax.set_ylabel(labels[i])
+        ax.grid(True, which="both", alpha=0.3)
+        if i == 0:
+            ax.legend(loc="best")
+
+    axes[-1].set_xlabel("time t")
+    fig.suptitle(title, y=0.98)
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _print_dt_summary(dts: np.ndarray, max_show: int = 12) -> None:
+    dts = np.asarray(dts, dtype=np.float64).reshape(-1)
+    print("Δt summary for selected TEST trajectory:")
+    print(f"  n_steps: {dts.size}")
+    print(f"  min:     {dts.min():.6e}")
+    print(f"  median:  {np.median(dts):.6e}")
+    print(f"  max:     {dts.max():.6e}")
+    show = min(max_show, dts.size)
+    head = " ".join(f"{x:.3e}" for x in dts[:show])
+    print(f"  first {show} Δt: {head}")
+    if dts.size > show:
+        tail = " ".join(f"{x:.3e}" for x in dts[-min(5, dts.size):])
+        print(f"  last {min(5, dts.size)} Δt:  {tail}")
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main(cfg: EvalConfig) -> None:
-    set_plot_style()
+    run_dir = Path(cfg.log_dir) / cfg.run_name
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    rdir = Path(cfg.log_dir) / cfg.run_name
-    if not rdir.exists():
-        raise FileNotFoundError(f"Run directory not found: {rdir}")
+    cfg_used_path = run_dir / "config_used.json"
+    if not cfg_used_path.exists():
+        raise FileNotFoundError(f"Missing config_used.json: {cfg_used_path}")
+    cfg_used = json.loads(cfg_used_path.read_text())
+    act_name = str(cfg_used.get("activation", "swish"))
 
-    cfg_used = json.loads((rdir / "config_used.json").read_text())
-    act_name = cfg_used["activation"]
-
-    dataset_path = Path((rdir / "dataset_path.txt").read_text().strip())
+    dataset_path = _resolve_dataset_path(run_dir)
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset cache not found: {dataset_path}")
 
+    splits_path = run_dir / "splits.npz"
+    if not splits_path.exists():
+        raise FileNotFoundError(f"Missing splits.npz: {splits_path}")
+
+    splits = load_npz(splits_path)
+    test_idx = splits.get("test_idx", None)
+    if test_idx is None or np.asarray(test_idx).size == 0:
+        raise RuntimeError("No test trajectories found (test_idx missing or empty).")
+    test_idx = np.asarray(test_idx, dtype=np.int64)
+
     data = load_npz(dataset_path)
-    splits = load_npz(rdir / "splits.npz")
-    norm = load_norm_stats(rdir / "norm_stats.npz")
+    ys_all = np.asarray(data["ys"][test_idx], dtype=np.float64)       # [Ntest, T+1, 3]
+    dts_all = np.asarray(data["dts"][test_idx], dtype=np.float64)     # [Ntest, T] (or [Ntest, T+1] if stored times)
+    if ys_all.ndim != 3 or ys_all.shape[-1] != 3:
+        raise ValueError(f"Unexpected ys shape: {ys_all.shape}")
+    if dts_all.ndim != 2:
+        raise ValueError(f"Unexpected dts shape: {dts_all.shape}")
 
-    test_idx = splits["test_idx"]
-    if test_idx.size == 0:
-        raise RuntimeError("No test trajectories found (test split is empty).")
+    rng = np.random.default_rng(int(cfg.seed))
+    pick = int(rng.integers(0, ys_all.shape[0]))
+    y_true = ys_all[pick]      # [T+1, 3]
+    dts_or_t = dts_all[pick]   # [T] or [T+1]
 
-    ys_all = data["ys"][test_idx]         # [Ntest, T, 3] (float64)
-    dts_all = data["dts"][test_idx]       # [Ntest, T-1] (float64)
-    y0s_all = data["y0s"][test_idx]       # [Ntest, 3] (float64)
-    ks_all = data["ks"][test_idx]         # [Ntest, 3] (float64)
+    t_abs, dts = infer_time_and_dts(dts_or_t, y_len=y_true.shape[0])
+    t_log = make_log_time(t_abs)
 
-    Ntest, T, _ = ys_all.shape
-    K = int(cfg.ar_steps)
-    if (T - 1) <= K:
-        raise RuntimeError(f"Trajectory too short for ar_steps={K}: T={T}")
+    _print_dt_summary(dts)
 
-    rng = np.random.default_rng(cfg.seed)
+    dev = _select_device(cfg.eval_device)
 
-    # Choose profile + start index selection policy
-    def pick_profile_and_start() -> Tuple[int, int]:
-        prof = int(rng.integers(0, Ntest))
-        start = int(rng.integers(0, (T - 1) - K))  # ensures K steps available
-        return prof, start
+    norm_path = run_dir / "norm_stats.npz"
+    if not norm_path.exists():
+        raise FileNotFoundError(f"Missing norm_stats.npz: {norm_path}")
+    norm = load_norm_stats(norm_path, device=dev)
 
-    if cfg.same_profile_for_models:
-        shared_prof, shared_start = pick_profile_and_start()
-        picks = {"mlp": (shared_prof, shared_start), "deeponet": (shared_prof, shared_start)}
-    else:
-        picks = {"mlp": pick_profile_and_start(), "deeponet": pick_profile_and_start()}
+    ckpt = cfg.ckpt.lower().strip()
+    if ckpt not in ("best", "last"):
+        raise ValueError("ckpt must be 'best' or 'last'")
 
-    plots_dir = rdir / "plots"
-    plots_dir.mkdir(exist_ok=True)
+    mlp_path = run_dir / "models" / f"mlp_{ckpt}.pkl"
+    deeponet_path = run_dir / "models" / f"deeponet_{ckpt}.pkl"
+    if not mlp_path.exists():
+        raise FileNotFoundError(f"Missing MLP params: {mlp_path}")
+    if not deeponet_path.exists():
+        raise FileNotFoundError(f"Missing DeepONet params: {deeponet_path}")
 
-    fig, axes = plt.subplots(1, 2, figsize=(15.2, 5.6), sharey=True)
+    mlp_params = load_params(mlp_path, device=dev)
+    deeponet_params = load_params(deeponet_path, device=dev)
 
-    for ax, model_type in zip(axes, ["mlp", "deeponet"]):
-        prof_i, start_i = picks[model_type]
+    y0 = jax.device_put(jnp.asarray(y_true[0], dtype=jnp.float32), device=dev)
+    dts_j = jax.device_put(jnp.asarray(dts, dtype=jnp.float32), device=dev)
 
-        ys = ys_all[prof_i].astype(np.float64)         # [T,3]
-        dts = dts_all[prof_i].astype(np.float64)       # [T-1]
-        y0c = y0s_all[prof_i].astype(np.float64)       # [3]
-        kc = ks_all[prof_i].astype(np.float64)         # [3]
+    y_mlp = np.asarray(rollout_mlp_full(mlp_params, act_name=act_name, norm=norm, y0=y0, dts=dts_j))
+    y_deep = np.asarray(rollout_deeponet_full(deeponet_params, act_name=act_name, norm=norm, y0=y0, dts=dts_j))
 
-        # Full time axis for GT
-        t_full = np.concatenate([[0.0], np.cumsum(dts)], axis=0)  # [T]
-        start_t = float(t_full[start_i])
+    out_dir = run_dir / cfg.out_dirname
+    out_png_mlp = out_dir / f"{cfg.out_png_stem}_mlp.png"
+    out_png_deep = out_dir / f"{cfg.out_png_stem}_deeponet.png"
 
-        # AR dt segment and starting state
-        dt_seg = dts[start_i : start_i + K]                        # [K]
-        t_pred = t_full[start_i + 1 : start_i + 1 + K]             # [K]
-        y_start = ys[start_i]                                      # [3]
-        y_true_seg = ys[start_i + 1 : start_i + 1 + K]             # [K,3] (unused for plot but helpful debugging)
+    eps_plot = float(np.asarray(norm["eps"]))
 
-        # Load params
-        params_path = rdir / "models" / f"{model_type}_{cfg.ckpt}.pkl"
-        if not params_path.exists():
-            raise FileNotFoundError(f"Missing checkpoint: {params_path}")
-        params = load_params(params_path)
+    _plot_one_model(
+        t_log=t_log,
+        y_true=y_true,
+        y_pred=y_mlp,
+        out_png=out_png_mlp,
+        title="Random TEST trajectory: True vs MLP (square markers = jump predictions)",
+        eps_plot=eps_plot,
+    )
+    _plot_one_model(
+        t_log=t_log,
+        y_true=y_true,
+        y_pred=y_deep,
+        out_png=out_png_deep,
+        title="Random TEST trajectory: True vs DeepONet (square markers = jump predictions)",
+        eps_plot=eps_plot,
+    )
 
-        # JIT rollout (all float32)
-        y_pred_all = rollout_from_point_jit(
-            model_type=model_type,
-            params=params,
-            act_name=act_name,
-            norm=norm,
-            y_start=jnp.asarray(y_start, dtype=jnp.float32),
-            dt_seq=jnp.asarray(dt_seg[:, None], dtype=jnp.float32),
-            y0_const=jnp.asarray(y0c, dtype=jnp.float32),
-            k_const=jnp.asarray(kc, dtype=jnp.float32),
-        )
-        y_pred = np.asarray(y_pred_all[1:, :])  # [K,3] predicted at t_pred
-
-        # Plot entire GT + overlay preds
-        plot_fulltraj_overlay(
-            out_png=Path(""),  # unused here (we save once for the combined figure)
-            gt_time=t_full,
-            gt_y=ys,
-            start_t=start_t,
-            pred_time=t_pred,
-            pred_y=y_pred,
-            model_label=f"{model_type.upper()} ({cfg.ckpt}) | profile={prof_i} start_idx={start_i}",
-            eps_plot=cfg.eps_plot,
-            ax=ax,
-        )
-
-        ax.legend(loc="upper right", ncol=1)
-
-    fig.suptitle(f"Full ground-truth trajectories with 100-step AR overlays (seed={cfg.seed})")
-    fig.tight_layout()
-
-    out_png = plots_dir / f"{cfg.out_png_name}_{cfg.ckpt}.png"
-    fig.savefig(out_png)
-    plt.close(fig)
-
-    print("Saved:", str(out_png.resolve()))
-    print("Selection:", json.dumps({k: {"profile": v[0], "start_idx": v[1]} for k, v in picks.items()}, indent=2))
+    print(f"Saved: {out_png_mlp}")
+    print(f"Saved: {out_png_deep}")
+    print(f"(Picked trajectory index within test split: {pick})")
 
 
 if __name__ == "__main__":

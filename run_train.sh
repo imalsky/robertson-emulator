@@ -88,3 +88,4 @@ if not any(d.platform in ("gpu", "cuda") for d in jax.devices()):
 PY
 
 srun python -u train_robertson.py
+#srun python -u eval.py
