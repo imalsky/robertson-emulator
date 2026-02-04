@@ -13,5 +13,6 @@ env/
 
 # Training Logs and Outputs
 runs_robertson/
+runs/
 *.csv
 *.npz
