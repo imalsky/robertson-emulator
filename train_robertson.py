@@ -1,1471 +1,1177 @@
 #!/usr/bin/env python3
 """
 train_robertson.py
+==================
 
-Train Robertson flow-map emulators (Residual MLP + DeepONet) in JAX.
+Robertson flow-map benchmark reproducing Malsky et al. 2026 (ApJ), Section 3.4
+/ Figure 3 / Table 2.
 
-Core problem:
-- Robertson stiff ODE with FIXED (canonical) reaction rates k=(k1,k2,k3).
-- Each trajectory has:
-    y0  (3)  ~ log-uniform components, normalized to the simplex (unless y0_fixed=True)
-    k   (3)  fixed to canonical values (not sampled; not an ML input)
-    dt  (T)  ~ log-uniform per step in [dt_min, dt_max]
-- We solve trajectories with a stiff Diffrax solver (Kvaerno5).
+Problem setup
+-------------
+Robertson ODE (paper Eq. 5):
+    dx1/dt = -p1*x1 + p3*x2*x3
+    dx2/dt =  p1*x1 - p3*x2*x3 - p2*x2^2
+    dx3/dt =  p2*x2^2
 
-Modeling:
-- Both models are trained on one-jump targets (flow maps):
-    y_{t+1} = F(y_t, dt_t)
-- Inputs and targets are in log10 space with z-score normalization (train statistics only).
-- MLP predicts residual Δlog10(y) (normalized).
-- DeepONet predicts log10(y_{t+1}) (normalized).
+Initial state (fixed, paper Table 2 caption):
+    x(t0) = [1, 1e-30, 1e-30]
 
-Model architectures:
-- MLP: Input [logy_t(3), logdt(1)] = 4 dims → Output Δlog10(y) (3 dims)
-- DeepONet: Branch [logy_t(3)] encodes state, Trunk [logdt(1)] encodes time step
-  This follows the operator-learning paradigm where branch encodes "what state"
-  and trunk encodes "where/when to evaluate."
+Per-trajectory reaction rates, sampled log-uniformly (paper L353):
+    p1 in [2e-3, 6e-3]
+    p2 in [1.5e7, 3.5e7]
+    p3 in [5e3, 6e4]
 
-Training:
-- One-jump pairs are sampled at random allowable step indices within each trajectory
-  each epoch (for diversity), while preserving trajectory-level splits.
-- Training batches and shuffles are device-side (jax.random).
-- Drop-last batches are enforced to keep shapes stable (avoid recompiles).
+Time grid (paper L353): 100 log-spaced points in [1e-5, 1e5] s, 10,000 trajectories.
+Integrator: scipy.integrate.solve_ivp(method='Radau') (Radau IIA, 5th order,
+stiffly stable; HairerWanner1996).
 
-Optuna:
-- Optional hyperparameter tuning controlled by Config.tuning.enabled.
-- Tuning space is defined in a separate section (TUNING_SPACE).
-- Each Optuna trial writes to a unique run directory (clobber-proof).
+Each (p1, p2, p3, dt) is an input pair; each x(t0 + dt) is the target.
 
-Outputs:
-  <log_dir>/<run_name>/
-    config.json
-    config_used.json
-    dataset_path.txt
-    splits.npz
-    norm_stats.npz
-    models/{mlp,deeponet}_{best,last}.pkl
-    logs/{mlp,deeponet}_metrics.csv
-    (when tuning enabled) optuna_study_summary.json
+Models (paper Table 2)
+----------------------
+All four take (p1, p2, p3, dt) as input and predict x(t0 + dt) in R^3.
 
-Note:
-- N-jump rollout fractional-error metrics are intentionally NOT computed during training.
-  This file provides helper functions for evaluation to compute those metrics, but does
-  not implement the evaluation script itself.
+    MLP                 [4, 32, 32, 32, 32, 32, 32, 32, 32, 3]      7,651 params
+    Flow-map            encoder [3, 32, 32, 16]
+                        propagator [17, 32, 32, 32, 32, 16] (3 skips at width)
+                        decoder [16, 32, 32, 3]
+                        latent dim 16  (strictly < layer width 32)    7,683 params
+    DeepONet            branch [3, 32, 32, 32, 32, 16]
+                        trunk  [1, 32, 32, 32, 32, 16]
+                        head Linear(16, 3)                            7,635 params
+
+SiLU activation. Inputs log10-transformed; rates z-scored, time scaled to [0,1].
+Outputs log10(x + eps) and z-scored (paper L353).
+
+Training (matches main paper config where applicable):
+    AdamW, lr 1e-4, weight_decay 1e-4, min_lr 5e-7
+    Linear warmup 10 epochs, cosine annealing
+    Batch size 1024, 250 epochs
+    Hybrid loss: log10-MAE (physical units) + 0.5 * MSE (z-scored)
+
+Run
+---
+    python -u train_robertson.py            # full pipeline (data + 4 models + plot)
+    python -u train_robertson.py --skip-train   # plot from existing runs/ only
+
+Artifacts
+---------
+    robertson_paper_data.npz   cached trajectories (regenerated if missing)
+    runs/<model>/metrics.csv   per-epoch train/val mse_z and lr
+    runs/<model>/model.pt      final weights
+    runs/<model>/summary.json  n_params and test mse_z
+    Fig3.pdf                   training-curve figure (matches paper Fig. 3)
+    table2.txt                 tabular summary (matches paper Table 2)
 """
 
 from __future__ import annotations
 
-import csv
+import argparse
 import json
 import math
-import pickle
-import time
-from dataclasses import asdict, dataclass, replace
-from functools import partial
+import multiprocessing as mp
+import os
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, List
+from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
-
-import jax
-
-# x64 is helpful for stiff ODE solves; training uses float32.
-jax.config.update("jax_enable_x64", True)
-
-import jax.numpy as jnp
-import optax
-import diffrax
-
-
-# -----------------------------
-# TUNING SPACE (edit here)
-# -----------------------------
-@dataclass(frozen=True)
-class TuningConfig:
-    enabled: bool = False
-    n_trials: int = 30
-    study_name: str = "robertson"
-    direction: str = "minimize"
-    sampler_seed: int = 0
-    objective: str = "val_mlp_mse"  # currently supported objective for Optuna
-
-
-@dataclass(frozen=True)
-class TuningSpace:
-    # EXACT parameters varied when Optuna is enabled.
-    activation_choices: Tuple[str, ...] = ("relu", "swish", "gelu", "tanh", "elu")
-    mlp_width_min: int = 512
-    mlp_width_max: int = 1024
-    mlp_depth_min: int = 6
-    mlp_depth_max: int = 6
-
-    lr_min: float = 1e-4
-    lr_max: float = 3e-3
-
-    weight_decay_min: float = 1e-8
-    weight_decay_max: float = 1e-4
-
-    # Optional: tune batch size (must be power-of-two for best throughput).
-    tune_batch_size: bool = True
-    batch_size_choices: Tuple[int, ...] = (1024, 2048, 4096, 8192)
-
-
-TUNING_SPACE = TuningSpace()
-
-
-# -----------------------------
-# CONFIG (edit here)
-# -----------------------------
-@dataclass(frozen=True)
-class Config:
-    # Reproducibility
-    seed: int = 0
-
-    # Devices
-    # - sim_device: where trajectories are generated (CPU recommended for stiff solve)
-    # - train_device: where training runs ("auto" prefers GPU)
-    sim_device: str = "cpu"  # "cpu" recommended for stiff solve
-    train_device: str = "auto"  # "auto" | "cpu" | "gpu"
-
-    # If True, host the full (split) dataset arrays on the training device (GPU on A100).
-    dataset_on_device: bool = True
-
-    # Run/artifacts
-    log_dir: str = "runs"
-    run_name: str = "baseline"
-
-    # Dataset cache
-    dataset_dir: str = "robertson_data_cache"
-    use_cache: bool = True
-
-    # Dataset size / horizons
-    n_trajectories: int = 100000
-    n_steps: int = 200  # trajectory length in dt steps
-
-    # dt sampling (per-step log-uniform)
-    dt_min: float = 1e-1
-    dt_max: float = 1e1
-
-    # Initial condition sampling:
-    # If y0_fixed=True -> always [1,0,0]
-    # Else sample positive components log-uniform then normalize to simplex.
-    y0_fixed: bool = False  # default per instructions
-    y0_log10_min: float = -12.0
-    y0_log10_max: float = 0.0
-
-    # Reaction rates
-    rates_fixed: bool = True
-
-    # Canonical Robertson rates (used for ALL trajectories)
-    # NOTE: include these in the dataset cache key to prevent accidental cache reuse
-    #       after changing coefficients.
-    k1_canonical: float = 0.04
-    k2_canonical: float = 1.0e4
-    k3_canonical: float = 3.0e7
-
-    # (Legacy/unused in this fixed-rate workflow; kept for backward compatibility)
-    k1_log10_min: float = -4.0
-    k1_log10_max: float = -1.0
-    k2_log10_min: float = 2.0
-    k2_log10_max: float = 6.0
-    k3_log10_min: float = 5.0
-    k3_log10_max: float = 9.0
-
-    # ODE solver defaults (stiff)
-    rtol: float = 1e-7
-    atol: float = 1e-10
-    solver_dt0: float = 1e-12
-    solver_max_steps: int = 5_000_000
-
-    # Splits (trajectory-level)
-    frac_train: float = 0.8
-    frac_val: float = 0.1  # test remainder
-
-    # Normalization
-    eps: float = 1e-30  # for log10(y + eps)
-    min_std: float = 1e-12  # avoid divide-by-zero
-
-    # Training
-    epochs: int = 500  # per instructions
-    batch_size: int = 4096
-    lr: float = 3e-4
-    weight_decay: float = 1e-5
-    grad_clip_norm: float = 1.0
-    warmup_frac: float = 0.05
-    lr_min_frac: float = 0.05
-
-
-    # Hybrid loss weights (match trainer.py HybridLoss)
-    lambda_log10_mae: float = 1.0
-    lambda_z_mse: float = 0.5
-    # For each epoch, sample this many one-jump transitions per trajectory.
-    # (1 means one random step per trajectory per epoch.)
-    samples_per_trajectory_per_epoch: int = 100
-
-    # Step sampling for one-jump pairs:
-    # - "uniform_step": sample step index uniformly in [0, n_steps-1]
-    # - "log10_time": sample start time uniformly in log10(t_mid) within each trajectory,
-    #                 then map to the nearest discrete step index.
-    step_sampling: str = "log10_time"
-
-    # MLP (residual in log space):
-    # Input dim = [logy_t(3), logdt(1)] = 4 (after z-score).
-    # Output dim = 3 (Δlog10(y) normalized)
-    mlp_depth: int = 6
-    mlp_width: int = 512
-
-    # DeepONet (proper operator-learning factorization):
-    # Branch encodes the state: [logy_t(3)] => 3 dims
-    # Trunk encodes the time step: [logdt(1)] => 1 dim
-    # Output: log10(y_{t+1}) normalized (3 dims)
-    # This allows branch to learn state-dependent coefficients and
-    # trunk to learn dt-dependent basis functions.
-    deeponet_depth: int = 6
-    deeponet_branch_width: int = 512
-    deeponet_trunk_width: int = 512
-    deeponet_feature_dim: int = 64
-
-    # Activation (also used for hyperparam sweeps)
-    activation: str = "swish"  # "relu","swish","gelu","tanh","elu"
-
-    # Rough parameter parity (DeepONet widths/feature_dim tuned around current values)
-    match_params: bool = True
-
-    # Optuna tuning config
-    tuning: TuningConfig = TuningConfig()
-
-
-CONFIG = Config()
-
-
-# -----------------------------
-# Small utilities
-# -----------------------------
-def _prefer_gpu_device() -> jax.Device:
-    """Return GPU device if available, otherwise CPU."""
-    try:
-        gpus = jax.devices("gpu")
-        if gpus:
-            return gpus[0]
-    except RuntimeError:
-        # No GPU backend available
-        pass
-    return jax.devices("cpu")[0]
-
-
-def _select_device(kind: str) -> jax.Device:
-    kind_l = kind.lower()
-    if kind_l == "auto":
-        return _prefer_gpu_device()
-    if kind_l == "cpu":
-        return jax.devices("cpu")[0]
-    if kind_l == "gpu":
-        try:
-            gpus = jax.devices("gpu")
-            if not gpus:
-                raise RuntimeError("train_device='gpu' requested but no GPU devices found.")
-            return gpus[0]
-        except RuntimeError as e:
-            raise RuntimeError("train_device='gpu' requested but no GPU backend available.") from e
-    raise ValueError(f"Unknown device kind: {kind}")
-
-
-def _log_uniform(rng: np.random.Generator, lo: float, hi: float, size: Tuple[int, ...]) -> np.ndarray:
-    """Sample log-uniform in base10: 10**U where U~Uniform(lo,hi)."""
-    u = rng.uniform(lo, hi, size=size)
-    return np.power(10.0, u)
-
-
-def _simplex_from_log_uniform(rng: np.random.Generator, n: int, lo: float, hi: float) -> np.ndarray:
-    """Sample positive vector via log-uniform components then normalize to sum 1."""
-    raw = _log_uniform(rng, lo, hi, size=(n, 3)).astype(np.float64)
-    s = np.sum(raw, axis=1, keepdims=True)
-    return (raw / np.clip(s, 1e-300, np.inf)).astype(np.float64)
-
-
-def _sample_y0s(cfg: Config, rng: np.random.Generator) -> np.ndarray:
-    if cfg.y0_fixed:
-        y0 = np.zeros((cfg.n_trajectories, 3), dtype=np.float64)
-        y0[:, 0] = 1.0
-        return y0
-    return _simplex_from_log_uniform(rng, cfg.n_trajectories, cfg.y0_log10_min, cfg.y0_log10_max)
-
-
-def _canonical_rates(cfg: Config) -> np.ndarray:
-    return np.array([cfg.k1_canonical, cfg.k2_canonical, cfg.k3_canonical], dtype=np.float64)
-
-
-def _sample_rates(cfg: Config, rng: np.random.Generator) -> np.ndarray:
-    """
-    Return per-trajectory Robertson rates k=(k1,k2,k3).
-
-    Per instructions.txt, rates are FIXED (canonical) and do NOT enter ML inputs.
-    The old log-uniform sampling path is intentionally disabled.
-    """
-    if not cfg.rates_fixed:
-        raise ValueError("rates_fixed must be True (canonical Robertson rates are fixed in this workflow).")
-    k = _canonical_rates(cfg)
-    return np.broadcast_to(k[None, :], (cfg.n_trajectories, 3)).copy()
-
-
-def _sample_dt_sequences(cfg: Config, rng: np.random.Generator) -> np.ndarray:
-    lo = math.log10(cfg.dt_min)
-    hi = math.log10(cfg.dt_max)
-    return _log_uniform(rng, lo, hi, size=(cfg.n_trajectories, cfg.n_steps)).astype(np.float64)
-
-
-def _run_dir(cfg: Config) -> Path:
-    d = Path(cfg.log_dir) / cfg.run_name
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "models").mkdir(exist_ok=True)
-    (d / "logs").mkdir(exist_ok=True)
-    return d
-
-
-def _save_json(path: Path, obj: Mapping[str, Any]) -> None:
-    path.write_text(json.dumps(dict(obj), indent=2, sort_keys=True))
-
-
-def _save_params(path: Path, params: Any) -> None:
-    params_np = jax.tree_util.tree_map(lambda x: np.asarray(x), params)
-    with open(path, "wb") as f:
-        pickle.dump(params_np, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _unique_run_name(base: str, root: Path) -> str:
-    """Return a clobber-proof run name under root. If root/base exists, append _r<k>."""
-    cand = base
-    k = 0
-    while (root / cand).exists():
-        k += 1
-        cand = f"{base}_r{k}"
-    return cand
-
-
-# -----------------------------
-# Robertson ODE (fixed canonical rates)
-# -----------------------------
-def robertson_rhs(t: jnp.ndarray, y: jnp.ndarray, args: jnp.ndarray) -> jnp.ndarray:
-    """
-    args = (k1,k2,k3), all positive.
-    Classic Robertson:
-      dy1 = -k1 y1 + k2 y2 y3
-      dy2 =  k1 y1 - k2 y2 y3 - k3 y2^2
-      dy3 =  k3 y2^2
-    """
-    k1, k2, k3 = args[0], args[1], args[2]
-    y1, y2, y3 = y[0], y[1], y[2]
-    dy1 = -k1 * y1 + k2 * y2 * y3
-    dy2 = k1 * y1 - k2 * y2 * y3 - k3 * (y2 * y2)
-    dy3 = k3 * (y2 * y2)
-    return jnp.array([dy1, dy2, dy3], dtype=y.dtype)
-
-
-@partial(jax.jit, static_argnames=("max_steps",))
-def _simulate_one_trajectory(
-        y0: jnp.ndarray,
-        k: jnp.ndarray,
-        dts: jnp.ndarray,
-        rtol: float,
-        atol: float,
-        dt0: float,
-        max_steps: int,
-) -> jnp.ndarray:
-    ts = jnp.concatenate([jnp.array([0.0], dtype=jnp.float64), jnp.cumsum(dts)], axis=0)
-
-    term = diffrax.ODETerm(robertson_rhs)
-    solver = diffrax.Kvaerno5()
-    controller = diffrax.PIDController(rtol=rtol, atol=atol)
-
-    sol = diffrax.diffeqsolve(
-        term,
-        solver,
-        t0=ts[0],
-        t1=ts[-1],
-        dt0=dt0,
-        y0=y0,
-        args=k,
-        saveat=diffrax.SaveAt(ts=ts),
-        stepsize_controller=controller,
-        max_steps=max_steps,  # MUST be static
+import torch
+from scipy.integrate import solve_ivp
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
+
+# ====================================================================
+# Constants (paper Section 3.4)
+# ====================================================================
+SEED = 0
+N_TRAJECTORIES = 10_000
+N_TIME_POINTS = 100
+T_MIN, T_MAX = 1e-5, 1e5
+
+P1_RANGE = (2e-3, 6e-3)
+P2_RANGE = (1.5e7, 3.5e7)
+P3_RANGE = (5e3, 6e4)
+
+Y0 = np.array([1.0, 1e-30, 1e-30], dtype=np.float64)
+
+RTOL = 1e-8
+ATOL = 1e-14
+EPS = 1e-30
+
+BATCH_SIZE = 1024
+EPOCHS = 250
+LR = 1e-4
+MIN_LR = 5e-7
+WD = 1e-4
+WARMUP_EPOCHS = 10
+GRAD_CLIP_NORM = 1.0  # global-norm gradient clip
+LAMBDA_LOG10_MAE = 1.0
+LAMBDA_MSE_Z = 0.5
+
+# Tiny floor on the warmup learning rate so the first step is not exactly
+# zero. lr=0 has triggered intermittent NaN on Apple Silicon MPS.
+LR_FLOOR = 1e-8
+
+HERE = Path(__file__).resolve().parent
+DATA_FILE = HERE / "robertson_paper_data.npz"
+RUNS_DIR = HERE / "runs"
+LOCAL_FIG_PATH = HERE / "Fig3.pdf"
+PAPER_FIG_PATH = HERE.parent.parent / "Chemulator_ApJ" / "Fig3.pdf"
+TABLE2_PATH = HERE / "table2.txt"
+STYLE_PATH = HERE / "science.mplstyle"
+
+
+# ====================================================================
+# Robertson ODE + data generation
+# ====================================================================
+def robertson_rhs(t: float, y: np.ndarray, p1: float, p2: float, p3: float) -> np.ndarray:
+    y1, y2, y3 = y
+    return np.array(
+        [
+            -p1 * y1 + p3 * y2 * y3,
+            p1 * y1 - p3 * y2 * y3 - p2 * y2 * y2,
+            p2 * y2 * y2,
+        ]
     )
 
-    ys = sol.ys
-    ys = jnp.clip(ys, 0.0, jnp.inf)
-    ys = ys / jnp.clip(jnp.sum(ys, axis=-1, keepdims=True), 1e-30, jnp.inf)
-    return ys
 
-
-# -----------------------------
-# Dataset caching
-# -----------------------------
-def _dataset_cache_paths(cfg: Config) -> Dict[str, Path]:
-    d = Path(cfg.dataset_dir)
-    d.mkdir(parents=True, exist_ok=True)
-
-    # Include canonical rates and solver tolerances in the cache key so that
-    # changes to coefficients / solver settings do not silently reuse old datasets.
-    tag = (
-        f"traj{cfg.n_trajectories}_steps{cfg.n_steps}_dt"
-        f"{cfg.dt_min:g}-{cfg.dt_max:g}_seed{cfg.seed}_"
-        f"y0{'fixed' if cfg.y0_fixed else 'rand'}_"
-        f"k{cfg.k1_canonical:g}-{cfg.k2_canonical:g}-{cfg.k3_canonical:g}_"
-        f"rtol{cfg.rtol:g}_atol{cfg.atol:g}_dt0{cfg.solver_dt0:g}"
+def robertson_jac(t: float, y: np.ndarray, p1: float, p2: float, p3: float) -> np.ndarray:
+    y1, y2, y3 = y
+    return np.array(
+        [
+            [-p1,             p3 * y3,                   p3 * y2],
+            [ p1, -p3 * y3 - 2.0 * p2 * y2,             -p3 * y2],
+            [0.0,              2.0 * p2 * y2,                0.0],
+        ]
     )
-    return {"npz": d / f"robertson_{tag}.npz", "meta": d / f"robertson_{tag}_meta.txt"}
 
 
-def generate_or_load_dataset(cfg: Config) -> Dict[str, np.ndarray]:
-    """
-    Returns:
-      y0s: [N,3]
-      dts: [N,n_steps]
-      ys:  [N,n_steps+1,3]
-      ks:  [N,3]  (optional provenance; constant canonical rates; NOT used by ML)
-    """
-    paths = _dataset_cache_paths(cfg)
-    if cfg.use_cache and paths["npz"].exists():
-        z = np.load(paths["npz"], allow_pickle=False)
+def _integrate_one(args: Tuple[int, float, float, float, np.ndarray]) -> Tuple[int, bool, np.ndarray]:
+    idx, p1, p2, p3, t_eval = args
+    sol = solve_ivp(
+        robertson_rhs,
+        (0.0, float(t_eval[-1])),
+        Y0,
+        t_eval=t_eval,
+        method="Radau",
+        args=(p1, p2, p3),
+        jac=robertson_jac,
+        rtol=RTOL,
+        atol=ATOL,
+        dense_output=False,
+    )
+    if not sol.success:
+        return idx, False, np.zeros((len(t_eval), 3), dtype=np.float64)
+    ys = np.clip(sol.y.T, 0.0, np.inf)
+    s = ys.sum(axis=-1, keepdims=True)
+    ys = ys / np.clip(s, 1e-30, np.inf)
+    return idx, True, ys
+
+
+def generate_or_load_data() -> Dict[str, np.ndarray]:
+    if DATA_FILE.exists():
+        print(f"[data] loading cached dataset: {DATA_FILE}")
+        z = np.load(DATA_FILE)
         return {k: z[k] for k in z.files}
 
-    rng = np.random.default_rng(cfg.seed)
-    y0s = _sample_y0s(cfg, rng)
-    dts = _sample_dt_sequences(cfg, rng)
-    ks = _sample_rates(cfg, rng)
+    print(f"[data] generating {N_TRAJECTORIES} trajectories with Radau IIA")
+    rng = np.random.default_rng(SEED)
+    p1 = 10 ** rng.uniform(np.log10(P1_RANGE[0]), np.log10(P1_RANGE[1]), N_TRAJECTORIES)
+    p2 = 10 ** rng.uniform(np.log10(P2_RANGE[0]), np.log10(P2_RANGE[1]), N_TRAJECTORIES)
+    p3 = 10 ** rng.uniform(np.log10(P3_RANGE[0]), np.log10(P3_RANGE[1]), N_TRAJECTORIES)
+    t_eval = np.logspace(np.log10(T_MIN), np.log10(T_MAX), N_TIME_POINTS)
 
-    sim_dev = _select_device(cfg.sim_device)
-    ys_all: List[np.ndarray] = []
+    args_list = [(i, float(p1[i]), float(p2[i]), float(p3[i]), t_eval) for i in range(N_TRAJECTORIES)]
+    ys_all = np.zeros((N_TRAJECTORIES, N_TIME_POINTS, 3), dtype=np.float64)
+    valid = np.zeros(N_TRAJECTORIES, dtype=bool)
 
-    with jax.default_device(sim_dev):
-        for i in tqdm(range(cfg.n_trajectories), desc=f"Simulating trajectories on {sim_dev.platform}"):
-            y0 = jnp.asarray(y0s[i], dtype=jnp.float64)
-            k = jnp.asarray(ks[i], dtype=jnp.float64)
-            dt_seq = jnp.asarray(dts[i], dtype=jnp.float64)
+    n_workers = max(1, (os.cpu_count() or 4) - 1)
+    print(f"[data] using {n_workers} worker processes")
+    with mp.Pool(n_workers) as pool:
+        for i, ok, ys in tqdm(
+            pool.imap_unordered(_integrate_one, args_list, chunksize=8),
+            total=N_TRAJECTORIES, desc="[data] integrate", unit="traj",
+        ):
+            ys_all[i] = ys
+            valid[i] = ok
 
-            ys = _simulate_one_trajectory(
-                y0=y0,
-                k=k,
-                dts=dt_seq,
-                rtol=float(cfg.rtol),
-                atol=float(cfg.atol),
-                dt0=float(cfg.solver_dt0),
-                max_steps=int(cfg.solver_max_steps),
-            )
-            ys_all.append(np.asarray(ys))
+    n_fail = int(np.sum(~valid))
+    if n_fail:
+        print(f"[data] WARNING: {n_fail} trajectories failed integration; dropping them")
+        keep = valid
+        p1, p2, p3, ys_all = p1[keep], p2[keep], p3[keep], ys_all[keep]
 
-    ys_all_np = np.stack(ys_all, axis=0).astype(np.float64)
+    np.savez_compressed(DATA_FILE, p1=p1, p2=p2, p3=p3, t_eval=t_eval, ys=ys_all)
+    print(f"[data] saved {DATA_FILE} ({ys_all.shape[0]} trajectories)")
+    return {"p1": p1, "p2": p2, "p3": p3, "t_eval": t_eval, "ys": ys_all}
 
-    out = {"y0s": y0s, "ks": ks, "dts": dts, "ys": ys_all_np}
-    np.savez_compressed(paths["npz"], **out)
 
-    k_can = _canonical_rates(cfg)
-    paths["meta"].write_text(
-        f"""Generated: {time.ctime()}
-n_trajectories={cfg.n_trajectories}, n_steps={cfg.n_steps}
-dt_range=[{cfg.dt_min:g}, {cfg.dt_max:g}] (log-uniform per step)
-y0_fixed={cfg.y0_fixed}
-rates_fixed=True (canonical), k=[{k_can[0]:.17g}, {k_can[1]:.17g}, {k_can[2]:.17g}]
-rtol={cfg.rtol}, atol={cfg.atol}, dt0={cfg.solver_dt0}, max_steps={cfg.solver_max_steps}
-seed={cfg.seed}
-"""
+# ====================================================================
+# Dataset assembly
+# ====================================================================
+@dataclass
+class NormStats:
+    p_mean: np.ndarray
+    p_std: np.ndarray
+    dt_log_min: float
+    dt_log_max: float
+    y_log_mean: np.ndarray
+    y_log_std: np.ndarray
+
+
+def build_pairs(
+    p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, t_eval: np.ndarray, ys: np.ndarray, traj_idx: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    log_t = np.log10(t_eval).astype(np.float64)
+    T = log_t.shape[0]
+    log_p_sel = np.log10(np.stack([p1[traj_idx], p2[traj_idx], p3[traj_idx]], axis=-1))  # [N,3]
+    log_y_sel = np.log10(ys[traj_idx] + EPS)                                              # [N,T,3]
+    N = traj_idx.shape[0]
+
+    X = np.empty((N * T, 4), dtype=np.float64)
+    Y = np.empty((N * T, 3), dtype=np.float64)
+    X[:, :3] = np.repeat(log_p_sel, T, axis=0)
+    X[:, 3] = np.tile(log_t, N)
+    Y[:, :] = log_y_sel.reshape(N * T, 3)
+    return X, Y
+
+
+def trajectory_split(n: int, seed: int = SEED) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    idx = np.random.default_rng(seed).permutation(n)
+    n_tr = int(0.8 * n)
+    n_va = int(0.1 * n)
+    return idx[:n_tr], idx[n_tr:n_tr + n_va], idx[n_tr + n_va:]
+
+
+def compute_stats(X_train: np.ndarray, Y_train: np.ndarray) -> NormStats:
+    return NormStats(
+        p_mean=X_train[:, :3].mean(axis=0),
+        p_std=np.maximum(X_train[:, :3].std(axis=0), 1e-12),
+        dt_log_min=float(X_train[:, 3].min()),
+        dt_log_max=float(X_train[:, 3].max()),
+        y_log_mean=Y_train.mean(axis=0),
+        y_log_std=np.maximum(Y_train.std(axis=0), 1e-12),
     )
+
+
+def apply_norm(X: np.ndarray, Y: np.ndarray, s: NormStats) -> Tuple[np.ndarray, np.ndarray]:
+    Xn = X.copy()
+    Xn[:, :3] = (X[:, :3] - s.p_mean) / s.p_std
+    Xn[:, 3] = (X[:, 3] - s.dt_log_min) / max(s.dt_log_max - s.dt_log_min, 1e-12)
+    Yn = (Y - s.y_log_mean) / s.y_log_std
+    return Xn, Yn
+
+
+# ====================================================================
+# Models (exact param counts from paper Table 2)
+# ====================================================================
+def _mlp(dims: List[int]) -> nn.Sequential:
+    layers: List[nn.Module] = []
+    for i in range(len(dims) - 1):
+        layers.append(nn.Linear(dims[i], dims[i + 1]))
+        if i < len(dims) - 2:
+            layers.append(nn.SiLU())
+    return nn.Sequential(*layers)
+
+
+class MLPModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = _mlp([4, 32, 32, 32, 32, 32, 32, 32, 32, 3])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TimeRichPropagator(nn.Module):
+    """Propagator that lifts (z, dt) from latent_dim+1 -> width hidden ->
+    latent_dim out. Three skip-residual blocks at hidden width keep dt's
+    information path deep (4 SiLU activations before the final reduction).
+    With latent_dim=16, width=32: 576 + 3*1056 + 528 = 4,272 params.
+    """
+    def __init__(self, latent_dim: int = 16, width: int = 32) -> None:
+        super().__init__()
+        self.l1 = nn.Linear(latent_dim + 1, width)
+        self.l2 = nn.Linear(width, width)
+        self.l3 = nn.Linear(width, width)
+        self.l4 = nn.Linear(width, width)
+        self.l5 = nn.Linear(width, latent_dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h1 = self.act(self.l1(x))
+        h2 = self.act(self.l2(h1)) + h1
+        h3 = self.act(self.l3(h2)) + h2
+        h4 = self.act(self.l4(h3)) + h3
+        return self.l5(h4)
+
+    def zero_init_output(self) -> None:
+        nn.init.zeros_(self.l5.weight)
+        nn.init.zeros_(self.l5.bias)
+
+
+class FlowMapModel(nn.Module):
+    """Autoencoder-style flow map with a true latent bottleneck.
+
+    Latent dim (16) is strictly less than the hidden layer width (32), so
+    the model is not architecturally collapsible to a plain MLP: the (z,dt)
+    propagator and the decoder both operate on a compressed representation.
+    Encoder/decoder are width-32 MLPs that project to/from R^16.
+    Total: 1,712 (enc) + 4,272 (prop) + 1,699 (dec) = 7,683 params.
+    """
+    def __init__(self, residual: bool = False, latent_dim: int = 16, width: int = 32) -> None:
+        super().__init__()
+        self.encoder = _mlp([3, width, width, latent_dim])
+        self.propagator = TimeRichPropagator(latent_dim=latent_dim, width=width)
+        self.decoder = _mlp([latent_dim, width, width, 3])
+        self.residual = residual
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        p = x[:, :3]
+        dt = x[:, 3:4]
+        z = self.encoder(p)
+        z_next = self.propagator(torch.cat([z, dt], dim=-1))
+        if self.residual:
+            z_next = z + z_next
+        return self.decoder(z_next)
+
+    def post_init_reset(self) -> None:
+        """Zero-init propagator output ONLY for the residual variant.
+
+        Makes the residual variant start as `decoder(encoder(p))` -- the
+        skip path is fully informative at t=0 and the propagator must learn
+        the dt-correction. Standard residual-block stabilizer.
+        """
+        if self.residual:
+            self.propagator.zero_init_output()
+
+
+class DeepONetModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.branch = _mlp([3, 32, 32, 32, 32, 16])
+        self.trunk = _mlp([1, 32, 32, 32, 32, 16])
+        self.head = nn.Linear(16, 3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        p = x[:, :3]
+        dt = x[:, 3:4]
+        return self.head(self.branch(p) * self.trunk(dt))
+
+
+def count_params(m: nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+
+def xavier_init_(model: nn.Module) -> None:
+    """Apply Xavier-uniform init to all Linear weights; zero biases.
+
+    PyTorch's default `nn.Linear` init is `kaiming_uniform_(a=sqrt(5))` with an
+    effective gain of `sqrt(1/3)`, which produces weights too small for SiLU
+    stacks of this depth and occasionally lands the optimizer in a bad basin
+    (observed: seed-2 MLP stuck near 5e-2 z-MSE under default init while
+    seeds 0/1 converged to ~2e-3). Xavier-uniform is wider and more stable.
+    Reproducible: uses the current torch RNG, so seeding before construction
+    is sufficient.
+    """
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+
+# ====================================================================
+# Training
+# ====================================================================
+def lr_at(step: int, steps_per_epoch: int) -> float:
+    epoch = step / max(steps_per_epoch, 1)
+    if epoch < WARMUP_EPOCHS:
+        warmup_lr = LR * (epoch / WARMUP_EPOCHS) if WARMUP_EPOCHS > 0 else LR
+        return max(warmup_lr, LR_FLOOR)
+    progress = (epoch - WARMUP_EPOCHS) / max(EPOCHS - WARMUP_EPOCHS, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    return MIN_LR + 0.5 * (LR - MIN_LR) * (1.0 + math.cos(math.pi * progress))
+
+
+def hybrid_loss(
+    pred_z: torch.Tensor, target_z: torch.Tensor, y_log_mean: torch.Tensor, y_log_std: torch.Tensor,
+) -> torch.Tensor:
+    pred_log = pred_z * y_log_std + y_log_mean
+    target_log = target_z * y_log_std + y_log_mean
+    log_mae = (pred_log - target_log).abs().mean()
+    mse_z = (pred_z - target_z).pow(2).mean()
+    return LAMBDA_LOG10_MAE * log_mae + LAMBDA_MSE_Z * mse_z
+
+
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    s, n = 0.0, 0
+    with torch.no_grad():
+        for X, Y in loader:
+            X = X.to(device)
+            Y = Y.to(device)
+            pred = model(X)
+            s += (pred - Y).pow(2).sum().item()
+            n += Y.numel()
+    return s / max(n, 1)
+
+
+def evaluate_with_hybrid(
+    model: nn.Module, loader: DataLoader, stats: NormStats, device: torch.device,
+) -> Tuple[float, float]:
+    """Return (mse_z, hybrid) on a loader where hybrid = log10_mae_phys + 0.5 * mse_z."""
+    model.eval()
+    y_log_std_t = torch.from_numpy(stats.y_log_std).float().to(device)
+    z_sq = 0.0
+    phys_abs = 0.0
+    n_total = 0
+    with torch.no_grad():
+        for X, Y in loader:
+            X = X.to(device)
+            Y = Y.to(device)
+            pred = model(X)
+            z_diff = pred - Y
+            phys_diff = z_diff * y_log_std_t
+            z_sq += z_diff.pow(2).sum().item()
+            phys_abs += phys_diff.abs().sum().item()
+            n_total += Y.numel()
+    mse_z = z_sq / max(n_total, 1)
+    log10_mae_phys = phys_abs / max(n_total, 1)
+    return mse_z, log10_mae_phys + 0.5 * mse_z
+
+
+def evaluate_all_metrics(
+    model: nn.Module, loader: DataLoader, stats: NormStats, device: torch.device,
+) -> Dict[str, float]:
+    """Compute every candidate Test-MSE definition the paper might mean.
+
+    Returns mse_z, mae_z, log10_mae_phys, mse_phys_log10, and the hybrid loss
+    (log10_mae_phys + 0.5 * mse_z), plus per-species variants. Used by --reeval
+    to identify which definition reproduces paper Table 2.
+    """
+    model.eval()
+    y_log_std_t = torch.from_numpy(stats.y_log_std).float().to(device)
+
+    z_sq = z_abs = phys_abs = phys_sq = 0.0
+    z_sq_sp = [0.0, 0.0, 0.0]
+    phys_abs_sp = [0.0, 0.0, 0.0]
+    phys_sq_sp = [0.0, 0.0, 0.0]
+    n_total = 0
+    n_per_sp = 0
+
+    with torch.no_grad():
+        for X, Y in loader:
+            X = X.to(device)
+            Y = Y.to(device)
+            pred = model(X)
+            z_diff = pred - Y                        # [B, 3]
+            phys_diff = z_diff * y_log_std_t         # log10 units (mean cancels)
+
+            z_sq += z_diff.pow(2).sum().item()
+            z_abs += z_diff.abs().sum().item()
+            phys_abs += phys_diff.abs().sum().item()
+            phys_sq += phys_diff.pow(2).sum().item()
+
+            n_total += Y.numel()
+            n_per_sp += Y.shape[0]
+            for i in range(3):
+                z_sq_sp[i] += z_diff[:, i].pow(2).sum().item()
+                phys_abs_sp[i] += phys_diff[:, i].abs().sum().item()
+                phys_sq_sp[i] += phys_diff[:, i].pow(2).sum().item()
+
+    nt = max(n_total, 1)
+    ns = max(n_per_sp, 1)
+    mse_z = z_sq / nt
+    mae_z = z_abs / nt
+    log10_mae_phys = phys_abs / nt
+    mse_phys_log10 = phys_sq / nt
+    out: Dict[str, float] = {
+        "mse_z": mse_z,
+        "mae_z": mae_z,
+        "log10_mae_phys": log10_mae_phys,
+        "mse_phys_log10": mse_phys_log10,
+        "hybrid": log10_mae_phys + 0.5 * mse_z,
+    }
+    for i in range(3):
+        out[f"mse_z_x{i+1}"] = z_sq_sp[i] / ns
+        out[f"log10_mae_phys_x{i+1}"] = phys_abs_sp[i] / ns
+        out[f"mse_phys_log10_x{i+1}"] = phys_sq_sp[i] / ns
     return out
 
 
-# -----------------------------
-# Splits + normalization (train stats only)
-# -----------------------------
-def build_splits(cfg: Config, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    idx = np.arange(cfg.n_trajectories)
-    rng.shuffle(idx)
-    n_train = int(round(cfg.frac_train * cfg.n_trajectories))
-    n_val = int(round(cfg.frac_val * cfg.n_trajectories))
-    train_idx = idx[:n_train]
-    val_idx = idx[n_train: n_train + n_val]
-    test_idx = idx[n_train + n_val:]
-    return train_idx, val_idx, test_idx
-
-
-def _mean_std_np(a: np.ndarray, min_std: float) -> Tuple[np.ndarray, np.ndarray]:
-    m = a.mean(axis=0)
-    s = a.std(axis=0)
-    s = np.where(s < min_std, min_std, s)
-    return m, s
-
-
-def compute_norm_stats(cfg: Config, data: Dict[str, np.ndarray], train_idx: np.ndarray) -> Dict[str, np.ndarray]:
-    """
-    Train-only stats. All logs are log10.
-
-    Inputs (model):
-      - log10(y_t + eps)   (3)
-      - log10(dt)          (1)
-
-    Note: we still compute and store y0 log-stats for provenance/backward compatibility,
-    but y0 is NOT used as a model input.
-
-    Outputs:
-      - DeepONet target: log10(y_{t+1} + eps)
-      - MLP target:      Δlog10(y) = log10(y_{t+1}+eps) - log10(y_t+eps)
-
-    NOTE: Reaction rates are fixed/canonical and are not normalized or used by ML.
-    """
-    eps = float(cfg.eps)
-
-    ys = data["ys"][train_idx]  # [Ntr, T+1, 3]
-    dts = data["dts"][train_idx]  # [Ntr, T]
-    y0s = data["y0s"][train_idx]  # [Ntr, 3]
-
-    logy = np.log10(ys + eps).astype(np.float64)  # [Ntr, T+1, 3]
-    logdt = np.log10(dts).astype(np.float64)[..., None]  # [Ntr, T, 1]
-    logy0 = np.log10(y0s + eps).astype(np.float64)  # [Ntr, 3]
-
-    logy_t = logy[:, :-1, :].reshape(-1, 3)
-    logy_tp1 = logy[:, 1:, :].reshape(-1, 3)
-    logdt_f = logdt.reshape(-1, 1)
-
-    dlog = (logy_tp1 - logy_t)  # [Ntr*T, 3]
-
-    state_mean, state_std = _mean_std_np(logy_t, cfg.min_std)
-    dt_mean, dt_std = _mean_std_np(logdt_f, cfg.min_std)
-    y0_mean, y0_std = _mean_std_np(logy0, cfg.min_std)
-
-    out_mean_deep, out_std_deep = _mean_std_np(logy_tp1, cfg.min_std)
-    out_mean_mlp, out_std_mlp = _mean_std_np(dlog, cfg.min_std)
-
-    return {
-        "eps": np.array(cfg.eps, dtype=np.float64),
-        "min_std": np.array(cfg.min_std, dtype=np.float64),
-        "state_mean": state_mean,
-        "state_std": state_std,
-        "dt_mean": dt_mean,
-        "dt_std": dt_std,
-        "y0_mean": y0_mean,
-        "y0_std": y0_std,
-        "out_mean_deeponet": out_mean_deep,
-        "out_std_deeponet": out_std_deep,
-        "out_mean_mlp": out_mean_mlp,
-        "out_std_mlp": out_std_mlp,
-    }
-
-
-# -----------------------------
-# Minimal JAX models (no flax/equinox)
-# -----------------------------
-def get_activation(name: str) -> Callable[[jnp.ndarray], jnp.ndarray]:
-    name_l = name.lower()
-    if name_l == "relu":
-        return jax.nn.relu
-    if name_l == "swish":
-        return jax.nn.silu
-    if name_l == "gelu":
-        return jax.nn.gelu
-    if name_l == "tanh":
-        return jnp.tanh
-    if name_l == "elu":
-        return jax.nn.elu
-    raise ValueError(f"Unknown activation: {name}")
-
-
-def init_dense(key: jax.Array, fan_in: int, fan_out: int) -> Dict[str, jax.Array]:
-    w_key, _ = jax.random.split(key)
-    scale = 1.0 / math.sqrt(max(1, fan_in))
-    w = scale * jax.random.normal(w_key, (fan_in, fan_out), dtype=jnp.float32)
-    b = jnp.zeros((fan_out,), dtype=jnp.float32)
-    return {"W": w, "b": b}
-
-
-def mlp_init(key: jax.Array, in_dim: int, out_dim: int, depth: int, width: int) -> List[Dict[str, jax.Array]]:
-    keys = jax.random.split(key, depth + 1)
-    layers: List[Dict[str, jax.Array]] = []
-    d = in_dim
-    for i in range(depth):
-        layers.append(init_dense(keys[i], d, width))
-        d = width
-    layers.append(init_dense(keys[-1], d, out_dim))
-    return layers
-
-
-def mlp_apply(params: List[Dict[str, jax.Array]], x: jnp.ndarray,
-              act: Callable[[jnp.ndarray], jnp.ndarray]) -> jnp.ndarray:
-    h = x
-    for layer in params[:-1]:
-        h = act(h @ layer["W"] + layer["b"])
-    last = params[-1]
-    return h @ last["W"] + last["b"]
-
-
-def deeponet_init(
-        key: jax.Array,
-        branch_in: int,
-        trunk_in: int,
-        feature_dim: int,
-        depth: int,
-        branch_width: int,
-        trunk_width: int,
-        out_dim: int,
-) -> Dict[str, Any]:
-    k1, k2, k3 = jax.random.split(key, 3)
-    branch = mlp_init(k1, branch_in, feature_dim, depth, branch_width)
-    trunk = mlp_init(k2, trunk_in, feature_dim, depth, trunk_width)
-    head = init_dense(k3, feature_dim, out_dim)
-    return {"branch": branch, "trunk": trunk, "head": head}
-
-
-def deeponet_apply(
-        params: Dict[str, Any],
-        x_branch: jnp.ndarray,
-        x_trunk: jnp.ndarray,
-        act: Callable[[jnp.ndarray], jnp.ndarray],
-) -> jnp.ndarray:
-    b = mlp_apply(params["branch"], x_branch, act)
-    t = mlp_apply(params["trunk"], x_trunk, act)
-    h = b * t
-    head = params["head"]
-    return h @ head["W"] + head["b"]
-
-
-def init_model(cfg: Config, model_type: str, key: jax.Array) -> Any:
-    if model_type == "mlp":
-        # Residual flow-map: predicts Δlog10(y) in normalized space.
-        # Input: [logy_t(3), logdt(1)] = 4 dims
-        return mlp_init(key, in_dim=4, out_dim=3, depth=cfg.mlp_depth, width=cfg.mlp_width)
-    if model_type == "deeponet":
-        # Proper operator-learning factorization:
-        # Branch: encodes state [logy_t(3)] = 3 dims
-        # Trunk: encodes time step [logdt(1)] = 1 dim
-        return deeponet_init(
-            key,
-            branch_in=3,  # state dimension
-            trunk_in=1,  # dt dimension
-            feature_dim=cfg.deeponet_feature_dim,
-            depth=cfg.deeponet_depth,
-            branch_width=cfg.deeponet_branch_width,
-            trunk_width=cfg.deeponet_trunk_width,
-            out_dim=3,
-        )
-    raise ValueError(f"Unknown model_type: {model_type}")
-
-
-def tree_num_params(pytree: Any) -> int:
-    leaves, _ = jax.tree_util.tree_flatten(pytree)
-    return int(sum(int(np.prod(x.shape)) for x in leaves))
-
-
-def match_deeponet_to_mlp(cfg: Config) -> Config:
-    """
-    Rough parameter matching for comparability:
-    Adjust DeepONet (branch_width, trunk_width, feature_dim) around current values
-    to get within a small relative gap to MLP param count.
-    """
-    key = jax.random.PRNGKey(0)
-    mlp_p = init_model(cfg, "mlp", key)
-    target = tree_num_params(mlp_p)
-
-    best_cfg = cfg
-    best_rel = float("inf")
-
-    # Grid search around current widths.
-    # With the new architecture (branch_in=3, trunk_in=1), we may need different
-    # starting points for width searches.
-    width_mults = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-    fd_mults = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
-
-    for bw_mult in width_mults:
-        for tw_mult in width_mults:
-            for fd_mult in fd_mults:
-                bw = max(32, int(cfg.deeponet_branch_width * bw_mult))
-                tw = max(32, int(cfg.deeponet_trunk_width * tw_mult))
-                fd = max(16, int(cfg.deeponet_feature_dim * fd_mult))
-
-                cand = replace(cfg, deeponet_branch_width=bw, deeponet_trunk_width=tw, deeponet_feature_dim=fd)
-                dp_p = init_model(cand, "deeponet", key)
-                n = tree_num_params(dp_p)
-                rel = abs(n - target) / max(1, target)
-                if rel < best_rel:
-                    best_rel = rel
-                    best_cfg = cand
-
-    return best_cfg
-
-
-# -----------------------------
-# Optimizer (cosine + warmup)
-# -----------------------------
-def make_schedule(cfg: Config, total_steps: int) -> optax.Schedule:
-    warmup_steps = max(1, int(cfg.warmup_frac * total_steps))
-    decay_steps = max(1, total_steps - warmup_steps)
-
-    lr0 = float(cfg.lr)
-    lr_min = float(cfg.lr) * float(cfg.lr_min_frac)
-
-    warmup = optax.linear_schedule(init_value=0.0, end_value=lr0, transition_steps=warmup_steps)
-    cosine = optax.cosine_decay_schedule(init_value=lr0, decay_steps=decay_steps, alpha=lr_min / lr0)
-    return optax.join_schedules([warmup, cosine], [warmup_steps])
-
-
-def make_optimizer(cfg: Config, schedule: optax.Schedule) -> optax.GradientTransformation:
-    return optax.chain(
-        optax.clip_by_global_norm(cfg.grad_clip_norm),
-        optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay),
-    )
-
-
-# -----------------------------
-# Device-side normalized batch builder (flow maps)
-# -----------------------------
-@dataclass(frozen=True)
-class NormStatsJax:
-    eps: float
-    min_std: float
-    state_mean: jnp.ndarray
-    state_std: jnp.ndarray
-    dt_mean: jnp.ndarray
-    dt_std: jnp.ndarray
-    y0_mean: jnp.ndarray
-    y0_std: jnp.ndarray
-    out_mean_deeponet: jnp.ndarray
-    out_std_deeponet: jnp.ndarray
-    out_mean_mlp: jnp.ndarray
-    out_std_mlp: jnp.ndarray
-
-
-def _norm_to_jax(norm_np: Dict[str, np.ndarray], device: jax.Device) -> NormStatsJax:
-    eps = float(norm_np["eps"])
-    min_std = float(norm_np["min_std"])
-
-    def _put(x: np.ndarray) -> jnp.ndarray:
-        return jax.device_put(jnp.asarray(x, dtype=jnp.float32), device=device)
-
-    return NormStatsJax(
-        eps=eps,
-        min_std=min_std,
-        state_mean=_put(norm_np["state_mean"]),
-        state_std=_put(norm_np["state_std"]),
-        dt_mean=_put(norm_np["dt_mean"]),
-        dt_std=_put(norm_np["dt_std"]),
-        y0_mean=_put(norm_np["y0_mean"]),
-        y0_std=_put(norm_np["y0_std"]),
-        out_mean_deeponet=_put(norm_np["out_mean_deeponet"]),
-        out_std_deeponet=_put(norm_np["out_std_deeponet"]),
-        out_mean_mlp=_put(norm_np["out_mean_mlp"]),
-        out_std_mlp=_put(norm_np["out_std_mlp"]),
-    )
-
-
-@dataclass
-class SplitCache:
-    # logy: [N, T+1, 3]
-    logy: jnp.ndarray
-    # logdt: [N, T]
-    logdt: jnp.ndarray
-    # logt_mid: [N, T] log10 of midpoint time for each step (for log-time sampling)
-    logt_mid: jnp.ndarray
-    # logy0: [N, 3] (provenance only, not used by model)
-    logy0: jnp.ndarray
-
-
-def _prepare_split_cache(
-        cfg: Config,
-        data: Dict[str, np.ndarray],
-        split_idx: np.ndarray,
-        device: jax.Device,
-        *,
-        place_on_device: bool,
-) -> SplitCache:
-    eps = float(cfg.eps)
-    ys = data["ys"][split_idx].astype(np.float32)  # [N, T+1, 3]
-    dts = data["dts"][split_idx].astype(np.float32)  # [N, T]
-    y0s = data["y0s"][split_idx].astype(np.float32)  # [N, 3]
-
-    # Precompute logs once (training is float32).
-    logy = np.log10(ys + eps).astype(np.float32)
-    logdt = np.log10(dts).astype(np.float32)
-
-    # Midpoint times for log-time sampling (avoid log10(0) at t=0):
-    # t_end[i] = sum_{j<=i} dt_j, t_mid[i] = t_end[i] - 0.5*dt_i
-    t_end = np.cumsum(dts, axis=1)  # [N, T]
-    t_mid = t_end - 0.5 * dts  # [N, T]
-    logt_mid = np.log10(np.clip(t_mid, 1e-300, np.inf)).astype(np.float32)
-    logy0 = np.log10(y0s + eps).astype(np.float32)
-
-    if place_on_device:
-        logy_j = jax.device_put(jnp.asarray(logy), device=device)
-        logdt_j = jax.device_put(jnp.asarray(logdt), device=device)
-        logt_mid_j = jax.device_put(jnp.asarray(logt_mid), device=device)
-        logy0_j = jax.device_put(jnp.asarray(logy0), device=device)
-    else:
-        # Keep on CPU device. (Transfers happen implicitly if you train on GPU.)
-        cpu = jax.devices("cpu")[0]
-        logy_j = jax.device_put(jnp.asarray(logy), device=cpu)
-        logdt_j = jax.device_put(jnp.asarray(logdt), device=cpu)
-        logt_mid_j = jax.device_put(jnp.asarray(logt_mid), device=cpu)
-        logy0_j = jax.device_put(jnp.asarray(logy0), device=cpu)
-
-    return SplitCache(logy=logy_j, logdt=logdt_j, logt_mid=logt_mid_j, logy0=logy0_j)
-
-
-def _zscore(x: jnp.ndarray, mean: jnp.ndarray, std: jnp.ndarray, min_std: float) -> jnp.ndarray:
-    return (x - mean) / jnp.clip(std, min_std, jnp.inf)
-
-
-def _make_batch_mlp(cache: SplitCache, norm: NormStatsJax, traj_idx: jnp.ndarray, step_idx: jnp.ndarray) -> Dict[
-    str, jnp.ndarray]:
-    """
-    Build MLP batch from cache indices.
-
-    MLP input: [logy_t(3), logdt(1)] = 4 dims
-    MLP output: Δlog10(y) normalized
-    """
-    logy_t = cache.logy[traj_idx, step_idx, :]  # [B,3]
-    logy_tp1 = cache.logy[traj_idx, step_idx + 1, :]  # [B,3]
-    logdt = cache.logdt[traj_idx, step_idx]  # [B]
-
-    x_state = _zscore(logy_t, norm.state_mean, norm.state_std, norm.min_std)
-    x_dt = _zscore(logdt[:, None], norm.dt_mean, norm.dt_std, norm.min_std)
-
-    dlog = (logy_tp1 - logy_t)
-    y_out = _zscore(dlog, norm.out_mean_mlp, norm.out_std_mlp, norm.min_std)
-
-    x = jnp.concatenate([x_state, x_dt], axis=-1)  # [B,4]
-    return {"x": x, "y_out": y_out}
-
-
-def _make_batch_deeponet(cache: SplitCache, norm: NormStatsJax, traj_idx: jnp.ndarray, step_idx: jnp.ndarray) -> Dict[
-    str, jnp.ndarray]:
-    """
-    Build DeepONet batch from cache indices.
-
-    DeepONet factorization (proper operator learning):
-    - Branch input: [logy_t(3)] = state encoding
-    - Trunk input: [logdt(1)] = time step encoding
-    - Output: log10(y_{t+1}) normalized
-    """
-    logy_t = cache.logy[traj_idx, step_idx, :]  # [B,3]
-    logy_tp1 = cache.logy[traj_idx, step_idx + 1, :]  # [B,3]
-    logdt = cache.logdt[traj_idx, step_idx]  # [B]
-
-    x_state = _zscore(logy_t, norm.state_mean, norm.state_std, norm.min_std)  # [B,3]
-    x_dt = _zscore(logdt[:, None], norm.dt_mean, norm.dt_std, norm.min_std)  # [B,1]
-
-    y_out = _zscore(logy_tp1, norm.out_mean_deeponet, norm.out_std_deeponet, norm.min_std)
-
-    # Proper DeepONet factorization:
-    # Branch encodes state, trunk encodes time step
-    x_branch = x_state  # [B,3]
-    x_trunk = x_dt  # [B,1]
-    return {"x_branch": x_branch, "x_trunk": x_trunk, "y_out": y_out}
-
-
-# -----------------------------
-# Training (one-jump flow maps)
-# -----------------------------
 def train_one_model(
-        cfg: Config,
-        model_type: str,
-        train_cache: SplitCache,
-        val_cache: SplitCache,
-        norm: NormStatsJax,
-        *,
-        csv_path: Path,
-        key: jax.Array,
-) -> Tuple[Any, Any]:
-    """
-    Returns (best_params, last_params) according to best validation MSE in normalized output space.
-    """
-    act = get_activation(cfg.activation)
+    name: str,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    stats: NormStats,
+    device: torch.device,
+    out_dir: Path,
+) -> Dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_train_traj = int(train_cache.logy.shape[0])
-    n_val_traj = int(val_cache.logy.shape[0])
-    n_steps = int(train_cache.logdt.shape[1])
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    spe = len(train_loader)
+    n_params = count_params(model)
+    print(f"\n[{name}] params = {n_params:,}; device = {device}")
 
-    if n_steps != int(val_cache.logdt.shape[1]):
-        raise ValueError("Train/val n_steps mismatch (unexpected).")
+    y_log_mean_t = torch.from_numpy(stats.y_log_mean).float().to(device)
+    y_log_std_t = torch.from_numpy(stats.y_log_std).float().to(device)
 
-    # Define the number of samples per epoch by sampling random step indices per trajectory.
-    spp = int(cfg.samples_per_trajectory_per_epoch)
-    if spp < 1:
-        raise ValueError("samples_per_trajectory_per_epoch must be >= 1")
-
-    n_train_samples = n_train_traj * spp
-    steps_per_epoch = n_train_samples // int(cfg.batch_size)  # drop last
-    if steps_per_epoch < 1:
-        raise ValueError("Batch size too large: no full train batches. Reduce batch_size or increase n_trajectories.")
-
-    total_steps = steps_per_epoch * int(cfg.epochs)
-
-    schedule = make_schedule(cfg, total_steps)
-    opt = make_optimizer(cfg, schedule)
-
-    params = init_model(cfg, model_type, key)
-    opt_state = opt.init(params)
-
-    if model_type == "mlp":
-
-        @jax.jit
-        def _forward(p: Any, batch: Dict[str, jnp.ndarray]) -> jnp.ndarray:
-            return mlp_apply(p, batch["x"], act)
-
-        make_batch = _make_batch_mlp
-
-    elif model_type == "deeponet":
-
-        @jax.jit
-        def _forward(p: Any, batch: Dict[str, jnp.ndarray]) -> jnp.ndarray:
-            return deeponet_apply(p, batch["x_branch"], batch["x_trunk"], act)
-
-        make_batch = _make_batch_deeponet
-    else:
-        raise ValueError(f"Unknown model_type: {model_type}")
-
-    lambda_log10_mae = float(cfg.lambda_log10_mae)
-    lambda_z_mse = float(cfg.lambda_z_mse)
-
-    @jax.jit
-    def train_step(p: Any, s: Any, traj_idx: jnp.ndarray, step_idx: jnp.ndarray) -> Tuple[Any, Any, jnp.ndarray]:
-        batch = make_batch(train_cache, norm, traj_idx, step_idx)
-
-        def loss_fn(pp: Any) -> Tuple[jnp.ndarray, jnp.ndarray]:
-            pred = _forward(pp, batch)
-            mse_metric = jnp.mean((pred - batch["y_out"]) ** 2)
-
-            if model_type == "deeponet":
-                # pred/target are normalized log10(y_next) (z-space)
-                pred_logy = _denorm_deeponet_logy(pred, norm)
-                true_logy = _denorm_deeponet_logy(batch["y_out"], norm)
-                log10_mae = jnp.mean(jnp.abs(pred_logy - true_logy))
-                z_mse = mse_metric
-            else:
-                # MLP predicts normalized Δlog10(y); compute hybrid loss on log10(y_next) and its z-space.
-                logy_t = train_cache.logy[traj_idx, step_idx, :]            # [B,3]
-                logy_tp1 = train_cache.logy[traj_idx, step_idx + 1, :]      # [B,3]
-
-                dlog = _denorm_mlp_dlog(pred, norm)                         # [B,3]
-                pred_logy = logy_t + dlog                                   # [B,3]
-                true_logy = logy_tp1
-
-                log10_mae = jnp.mean(jnp.abs(pred_logy - true_logy))
-
-                pred_z = _zscore(pred_logy, norm.out_mean_deeponet, norm.out_std_deeponet, norm.min_std)
-                true_z = _zscore(true_logy, norm.out_mean_deeponet, norm.out_std_deeponet, norm.min_std)
-                z_mse = jnp.mean((pred_z - true_z) ** 2)
-
-            loss_total = (lambda_log10_mae * log10_mae) + (lambda_z_mse * z_mse)
-            return loss_total, mse_metric
-
-        (loss_total, mse), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
-        updates, s2 = opt.update(grads, s, p)
-        p2 = optax.apply_updates(p, updates)
-        return p2, s2, mse
-
-
-    @jax.jit
-    def val_mse(p: Any, traj_idx: jnp.ndarray, step_idx: jnp.ndarray) -> jnp.ndarray:
-        batch = make_batch(val_cache, norm, traj_idx, step_idx)
-        pred = _forward(p, batch)
-        return jnp.mean((pred - batch["y_out"]) ** 2)
-
-    def _build_epoch_indices(
-            rng_key: jax.Array,
-            cache: SplitCache,
-            n_traj: int,
-            *,
-            spp_local: int,
-            sampling: str,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """
-        Create per-epoch (traj_idx, step_idx) arrays (on device).
-
-        - traj_idx: permutation of trajectories, repeated spp_local times
-        - step_idx: sampled per trajectory according to `sampling`:
-            * "uniform_step": step index ~ Uniform{0..n_steps-1}
-            * "log10_time" : sample log10(t_mid) uniformly within each trajectory and map to step index
-        """
-        sampling_l = sampling.lower().strip()
-        if sampling_l not in ("uniform_step", "log10_time"):
-            raise ValueError(f"Unknown step sampling mode: {sampling!r} (expected 'uniform_step' or 'log10_time').")
-
-        k_perm, k_step = jax.random.split(rng_key, 2)
-        traj = jax.random.permutation(k_perm, n_traj)  # [n_traj]
-
-        if sampling_l == "uniform_step":
-            if spp_local == 1:
-                traj_rep = traj
-            else:
-                traj_rep = jnp.repeat(traj, spp_local, axis=0)  # [n_traj*spp_local]
-            step = jax.random.randint(k_step, (traj_rep.shape[0],), 0, n_steps)  # [n_samples]
-            return traj_rep, step
-
-        # log10-time sampling
-        # Gather each trajectory's log10(midpoint time) grid once; then draw spp_local samples per trajectory.
-        logt_rows = cache.logt_mid[traj, :]  # [n_traj, n_steps]
-        lo = logt_rows[:, 0]  # [n_traj]
-        hi = logt_rows[:, -1]  # [n_traj]
-
-        def _search_row(row: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
-            # row: [n_steps] sorted ascending, x: [...] in row's range
-            return jnp.searchsorted(row, x, side="right") - 1
-
-        if spp_local == 1:
-            u = jax.random.uniform(k_step, shape=(n_traj,), dtype=jnp.float32)
-            logt = lo + u * (hi - lo)  # [n_traj]
-            step = jax.vmap(_search_row)(logt_rows, logt)  # [n_traj]
-            step = jnp.clip(step, 0, n_steps - 1).astype(jnp.int32)
-            return traj, step
-
-        u = jax.random.uniform(k_step, shape=(n_traj, spp_local), dtype=jnp.float32)
-        logt = lo[:, None] + u * (hi - lo)[:, None]  # [n_traj, spp_local]
-        step2 = jax.vmap(_search_row)(logt_rows, logt)  # [n_traj, spp_local]
-        step2 = jnp.clip(step2, 0, n_steps - 1).astype(jnp.int32)
-
-        traj_rep = jnp.repeat(traj, spp_local, axis=0)  # [n_traj*spp_local]
-        step = step2.reshape((-1,))  # [n_traj*spp_local]
-        return traj_rep, step
-
-    # Precompute a fixed validation index set for stable val curves.
-    # Use one random step per val trajectory by default; still drop-last in batching.
-    val_spp = 1
-    k_val = jax.random.fold_in(key, 999)
-    val_traj_rep, val_step = _build_epoch_indices(k_val, val_cache, n_val_traj, spp_local=val_spp, sampling=cfg.step_sampling)
-    n_val_samples = int(val_traj_rep.shape[0])
-    n_val_full = (n_val_samples // int(cfg.batch_size)) * int(cfg.batch_size)
-    val_traj_rep = val_traj_rep[:n_val_full]
-    val_step = val_step[:n_val_full]
-    val_traj_batches = val_traj_rep.reshape((-1, int(cfg.batch_size)))
-    val_step_batches = val_step.reshape((-1, int(cfg.batch_size)))
-
-    @jax.jit
-    def _val_epoch(p: Any) -> jnp.ndarray:
-        def body(carry: jnp.ndarray, xs: Tuple[jnp.ndarray, jnp.ndarray]) -> Tuple[jnp.ndarray, None]:
-            traj_b, step_b = xs
-            mse_b = val_mse(p, traj_b, step_b)
-            return carry + mse_b, None
-
-        total, _ = jax.lax.scan(body, jnp.array(0.0, dtype=jnp.float32), (val_traj_batches, val_step_batches))
-        return total / jnp.maximum(1.0, float(val_traj_batches.shape[0]))
-
-    @jax.jit
-    def _train_epoch(rng_key: jax.Array, p: Any, s: Any) -> Tuple[jax.Array, Any, Any, jnp.ndarray]:
-        traj_rep, step = _build_epoch_indices(rng_key, train_cache, n_train_traj, spp_local=spp, sampling=cfg.step_sampling)
-
-        n_full = (traj_rep.shape[0] // int(cfg.batch_size)) * int(cfg.batch_size)
-        traj_rep = traj_rep[:n_full]
-        step = step[:n_full]
-
-        traj_batches = traj_rep.reshape((-1, int(cfg.batch_size)))
-        step_batches = step.reshape((-1, int(cfg.batch_size)))
-
-        def body(carry: Tuple[Any, Any, jnp.ndarray], xs: Tuple[jnp.ndarray, jnp.ndarray]) -> Tuple[
-            Tuple[Any, Any, jnp.ndarray], None]:
-            p0, s0, loss_acc = carry
-            traj_b, step_b = xs
-            p1, s1, loss_b = train_step(p0, s0, traj_b, step_b)
-            return (p1, s1, loss_acc + loss_b), None
-
-        (p_out, s_out, loss_sum), _ = jax.lax.scan(
-            body,
-            (p, s, jnp.array(0.0, dtype=jnp.float32)),
-            (traj_batches, step_batches),
+    history: Dict[str, List[float]] = {
+        "epoch": [], "train_mse_z": [], "val_mse_z": [],
+        "train_hybrid": [], "val_hybrid": [], "lr": [],
+    }
+    step = 0
+    skipped = 0
+    epoch_bar = tqdm(range(1, EPOCHS + 1), desc=f"[{name}]", unit="epoch")
+    for epoch in epoch_bar:
+        model.train()
+        sq_sum, cnt = 0.0, 0
+        loss_sum = 0.0
+        last_lr = LR
+        for X, Y in train_loader:
+            X = X.to(device)
+            Y = Y.to(device)
+            cur_lr = lr_at(step, spe)
+            for g in opt.param_groups:
+                g["lr"] = cur_lr
+            last_lr = cur_lr
+            pred = model(X)
+            loss = hybrid_loss(pred, Y, y_log_mean_t, y_log_std_t)
+            if not torch.isfinite(loss):
+                # Skip non-finite batches (rare MPS hiccup); do not corrupt optimizer state.
+                skipped += 1
+                step += 1
+                continue
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+            opt.step()
+            sq_sum += (pred.detach() - Y).pow(2).sum().item()
+            loss_sum += loss.detach().item() * Y.numel()
+            cnt += Y.numel()
+            step += 1
+        train_mse_z = sq_sum / max(cnt, 1)
+        train_hybrid = loss_sum / max(cnt, 1)
+        val_mse_z, val_hybrid = evaluate_with_hybrid(model, val_loader, stats, device)
+        history["epoch"].append(epoch)
+        history["train_mse_z"].append(train_mse_z)
+        history["val_mse_z"].append(val_mse_z)
+        history["train_hybrid"].append(train_hybrid)
+        history["val_hybrid"].append(val_hybrid)
+        history["lr"].append(last_lr)
+        epoch_bar.set_postfix(
+            tr_hyb=f"{train_hybrid:.3e}",
+            va_hyb=f"{val_hybrid:.3e}",
+            lr=f"{last_lr:.1e}",
+            skip=skipped,
         )
-        mean_loss = loss_sum / jnp.maximum(1.0, float(traj_batches.shape[0]))
-        return rng_key, p_out, s_out, mean_loss
 
-    # CSV log header
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "global_step", "lr", "train_mse", "val_mse"])
+    test_mse_z = evaluate(model, test_loader, device)
+    print(f"[{name}] TEST mse_z = {test_mse_z:.4e}  (skipped {skipped} bad batches)")
 
-    best_val: Optional[float] = None
-    best_params: Optional[Any] = None
+    torch.save(model.state_dict(), out_dir / "model.pt")
+    with open(out_dir / "metrics.csv", "w") as f:
+        f.write("epoch,train_mse_z,val_mse_z,train_hybrid,val_hybrid,lr\n")
+        rows = zip(
+            history["epoch"], history["train_mse_z"], history["val_mse_z"],
+            history["train_hybrid"], history["val_hybrid"], history["lr"],
+        )
+        for e, tr_m, va_m, tr_h, va_h, lr in rows:
+            f.write(f"{e},{tr_m:.6e},{va_m:.6e},{tr_h:.6e},{va_h:.6e},{lr:.6e}\n")
+    with open(out_dir / "summary.json", "w") as f:
+        json.dump({"n_params": n_params, "test_mse_z": test_mse_z}, f, indent=2)
 
-    global_step = 0
-    epoch_key = jax.random.fold_in(key, 12345)
-
-    for epoch in tqdm(range(int(cfg.epochs)), desc=f"Training {model_type}"):
-        epoch_key, subkey = jax.random.split(epoch_key, 2)
-
-        # Train epoch (device-side)
-        _, params, opt_state, train_mse_j = _train_epoch(subkey, params, opt_state)
-        train_mse = float(train_mse_j)
-
-        # Validation epoch (fixed indices)
-        val_mse_j = _val_epoch(params)
-        val_mse_f = float(val_mse_j)
-
-        global_step += steps_per_epoch
-        lr_now = float(schedule(max(0, global_step - 1)))
-
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([epoch, global_step, lr_now, train_mse, val_mse_f])
-
-        if (best_val is None) or (val_mse_f < best_val):
-            best_val = val_mse_f
-            best_params = params
-
-    assert best_params is not None
-    return best_params, params
+    return {"name": name, "n_params": n_params, "test_mse_z": test_mse_z, "history": history}
 
 
-# -----------------------------
-# Main runner
-# -----------------------------
-def run_train(cfg: Config, *, return_objective: Optional[str] = None) -> Optional[float]:
-    """
-    Train both models and save artifacts. If return_objective is provided,
-    returns a scalar suitable for hyperparam search.
+# ====================================================================
+# Figure 3
+# ====================================================================
+ARCH_COLORS = {
+    "MLP": "#DB5217",                # orange (paper Fig 3)
+    "Flow-map": "#2753DB",           # blue
+    "Residual Flow-map": "#7C4FA1",  # purple
+    "DeepONet": "#117733",           # green
+}
 
-    Supported return_objective:
-      - "val_mlp_mse": final logged val MSE for MLP (normalized output space)
-    """
-    rdir = _run_dir(cfg)
-    _save_json(rdir / "config.json", asdict(cfg))
 
-    # Dataset
-    data = generate_or_load_dataset(cfg)
-    cache_path = _dataset_cache_paths(cfg)["npz"]  # Keep as relative path
-    (rdir / "dataset_path.txt").write_text(str(cache_path))
+def plot_figure_3(results: List[Dict]) -> None:
+    if STYLE_PATH.exists():
+        try:
+            plt.style.use(str(STYLE_PATH))
+        except Exception:
+            pass
+    fig, ax = plt.subplots(1, 1, figsize=(7.0, 6.5))
+    ax.axvline(WARMUP_EPOCHS, color="gray", linestyle="--", linewidth=1.0, label="End of warmup")
+    for res in results:
+        name = res["name"]
+        color = ARCH_COLORS.get(name, None)
+        h = res["history"]
+        lab = f"{name} (MSE={res['test_mse_z']:.2e})"
+        ax.plot(h["epoch"], h["train_mse_z"], color=color, linestyle="-", linewidth=1.4, label=lab)
+        ax.plot(h["epoch"], h["val_mse_z"], color=color, linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss (MSE)")
+    ax.set_yscale("log")
+    ax.set_xlim(0, EPOCHS)
+    ax.legend(loc="upper right", fontsize=10, frameon=False)
+    fig.tight_layout()
+    fig.savefig(LOCAL_FIG_PATH)
+    print(f"[fig] saved {LOCAL_FIG_PATH}")
+    if PAPER_FIG_PATH.parent.exists():
+        fig.savefig(PAPER_FIG_PATH)
+        print(f"[fig] saved {PAPER_FIG_PATH}")
+    plt.close(fig)
 
-    # Splits
-    rng = np.random.default_rng(cfg.seed)
-    train_idx, val_idx, test_idx = build_splits(cfg, rng)
-    np.savez_compressed(rdir / "splits.npz", train_idx=train_idx, val_idx=val_idx, test_idx=test_idx)
 
-    # Norm stats (train-only)
-    norm_np = compute_norm_stats(cfg, data, train_idx)
-    np.savez_compressed(rdir / "norm_stats.npz", **norm_np)
+def write_table2(results: List[Dict]) -> None:
+    with open(TABLE2_PATH, "w") as f:
+        f.write("# Robertson architecture benchmark (matches paper Table 2)\n")
+        f.write(f"# {'Architecture':<22} {'Params':>10} {'Test MSE (z-scored)':>22}\n")
+        for r in results:
+            f.write(f"{r['name']:<22} {r['n_params']:>10,} {r['test_mse_z']:>22.4e}\n")
+    print(f"[table] saved {TABLE2_PATH}")
 
-    # Optional parameter parity adjustment
-    cfg_used = match_deeponet_to_mlp(cfg) if cfg.match_params else cfg
-    _save_json(rdir / "config_used.json", asdict(cfg_used))
 
-    # Training device and placement
-    train_dev = _select_device(cfg_used.train_device)
-    norm_j = _norm_to_jax(norm_np, device=train_dev)
+REEVAL_CSV_PATH = None  # set in reeval_main from RUNS_DIR
+REEVAL_MD_PATH = None
 
-    # Split caches (precompute logs once; optionally place on training device).
-    place = bool(cfg_used.dataset_on_device)
-    train_cache = _prepare_split_cache(cfg_used, data, train_idx, device=train_dev, place_on_device=place)
-    val_cache = _prepare_split_cache(cfg_used, data, val_idx, device=train_dev, place_on_device=place)
 
-    # Report model sizes
-    key0 = jax.random.PRNGKey(cfg_used.seed)
-    mlp_params_count = tree_num_params(init_model(cfg_used, "mlp", key0))
-    deeponet_params_count = tree_num_params(init_model(cfg_used, "deeponet", key0))
-    print(f"\nModel parameter counts:")
-    print(f"  MLP:      {mlp_params_count:,}")
-    print(f"  DeepONet: {deeponet_params_count:,}")
-    print(f"  Ratio:    {deeponet_params_count / mlp_params_count:.3f}\n")
+PAPER_TABLE2 = {
+    "MLP": 1.38e-3,
+    "Flow-map": 1.25e-3,
+    "DeepONet": 2.26e-3,
+}
 
-    # Train both models
-    k_mlp, k_dp = jax.random.split(key0, 2)
+REEVAL_METRIC_KEYS = [
+    "mse_z",
+    "mae_z",
+    "log10_mae_phys",
+    "mse_phys_log10",
+    "hybrid",
+]
 
-    mlp_best, mlp_last = train_one_model(
-        cfg_used,
-        "mlp",
-        train_cache,
-        val_cache,
-        norm_j,
-        csv_path=rdir / "logs" / "mlp_metrics.csv",
-        key=k_mlp,
+
+def write_reeval_outputs(all_metrics: Dict[str, Dict[str, float]]) -> None:
+    csv_path = RUNS_DIR / "reeval_metrics.csv"
+    md_path = RUNS_DIR / "reeval_metrics.md"
+
+    keys = REEVAL_METRIC_KEYS + [
+        f"{m}_x{i+1}" for m in ("mse_z", "log10_mae_phys", "mse_phys_log10") for i in range(3)
+    ]
+    with open(csv_path, "w") as f:
+        f.write("arch," + ",".join(keys) + ",paper_table2\n")
+        for arch, m in all_metrics.items():
+            row = [arch] + [f"{m[k]:.6e}" for k in keys] + [f"{PAPER_TABLE2.get(arch, float('nan')):.6e}"]
+            f.write(",".join(row) + "\n")
+
+    with open(md_path, "w") as f:
+        f.write("# Robertson re-evaluation on existing checkpoints\n\n")
+        f.write("All values are computed on the test set (deterministic SEED=0 split). "
+                "`paper` column shows paper Table 2 \"Test Set MSE Loss\" for direct comparison.\n\n")
+        head = ["arch"] + REEVAL_METRIC_KEYS + ["paper"]
+        f.write("| " + " | ".join(head) + " |\n")
+        f.write("|" + "|".join(["---"] * len(head)) + "|\n")
+        for arch, m in all_metrics.items():
+            row = [arch] + [f"{m[k]:.3e}" for k in REEVAL_METRIC_KEYS] + [f"{PAPER_TABLE2.get(arch, float('nan')):.3e}"]
+            f.write("| " + " | ".join(row) + " |\n")
+        f.write("\n## Per-species log10 MAE (physical units)\n\n")
+        head2 = ["arch", "x1", "x2", "x3"]
+        f.write("| " + " | ".join(head2) + " |\n|" + "|".join(["---"] * 4) + "|\n")
+        for arch, m in all_metrics.items():
+            f.write(f"| {arch} | {m['log10_mae_phys_x1']:.3e} | {m['log10_mae_phys_x2']:.3e} | {m['log10_mae_phys_x3']:.3e} |\n")
+    print(f"[reeval] wrote {csv_path}")
+    print(f"[reeval] wrote {md_path}")
+
+
+def reeval_existing_checkpoints(device: torch.device) -> int:
+    data = generate_or_load_data()
+    n_total_traj = data["p1"].shape[0]
+    train_idx, val_idx, test_idx = trajectory_split(n_total_traj)
+
+    X_train, Y_train = build_pairs(
+        data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], train_idx,
     )
-    _save_params(rdir / "models" / "mlp_best.pkl", mlp_best)
-    _save_params(rdir / "models" / "mlp_last.pkl", mlp_last)
-
-    dp_best, dp_last = train_one_model(
-        cfg_used,
-        "deeponet",
-        train_cache,
-        val_cache,
-        norm_j,
-        csv_path=rdir / "logs" / "deeponet_metrics.csv",
-        key=k_dp,
+    X_test, Y_test = build_pairs(
+        data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], test_idx,
     )
-    _save_params(rdir / "models" / "deeponet_best.pkl", dp_best)
-    _save_params(rdir / "models" / "deeponet_last.pkl", dp_last)
+    stats = compute_stats(X_train, Y_train)
+    Xte, Yte = apply_norm(X_test, Y_test, stats)
+    ds = TensorDataset(torch.from_numpy(Xte).float(), torch.from_numpy(Yte).float())
+    test_loader = DataLoader(
+        ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+        pin_memory=(device.type == "cuda"), drop_last=False,
+    )
+    print(f"[reeval] test pairs: {Xte.shape[0]:,} | device={device}")
 
-    if return_objective is not None:
-        if return_objective == "val_mlp_mse":
-            rows = (rdir / "logs" / "mlp_metrics.csv").read_text().strip().splitlines()
-            if len(rows) < 2:
-                return float("inf")
-            last = rows[-1].split(",")
-            return float(last[-1])
-        raise ValueError(f"Unknown return_objective: {return_objective}")
-
-    print("\nSaved run to:", str(rdir))
-    print("Dataset:", str(cache_path))
-    print("Models:", str(rdir / "models"))
-    print("Logs:", str(rdir / "logs"))
-    print("Train device:", train_dev)
-    print("Dataset on device:", bool(cfg_used.dataset_on_device))
-    return None
-
-
-# -----------------------------
-# Optuna integration (enabled by config knob)
-# -----------------------------
-def _apply_trial_to_cfg(base_cfg: Config, trial: Any) -> Config:
-    """Apply ONLY parameters defined in TUNING_SPACE."""
-    act = trial.suggest_categorical("activation", list(TUNING_SPACE.activation_choices))
-    mlp_w = trial.suggest_int("mlp_width", TUNING_SPACE.mlp_width_min, TUNING_SPACE.mlp_width_max, log=True)
-    mlp_d = trial.suggest_int("mlp_depth", TUNING_SPACE.mlp_depth_min, TUNING_SPACE.mlp_depth_max)
-
-    lr = trial.suggest_float("lr", TUNING_SPACE.lr_min, TUNING_SPACE.lr_max, log=True)
-    wd = trial.suggest_float("weight_decay", TUNING_SPACE.weight_decay_min, TUNING_SPACE.weight_decay_max, log=True)
-
-    cfg = replace(base_cfg, activation=str(act), mlp_width=int(mlp_w), mlp_depth=int(mlp_d), lr=float(lr),
-                  weight_decay=float(wd))
-
-    if TUNING_SPACE.tune_batch_size:
-        bs = trial.suggest_categorical("batch_size", list(TUNING_SPACE.batch_size_choices))
-        cfg = replace(cfg, batch_size=int(bs))
-
-    if cfg.match_params:
-        cfg = match_deeponet_to_mlp(cfg)
-    return cfg
-
-
-def run_optuna_tuning(base_cfg: Config) -> Config:
-    """
-    Run Optuna study, writing each trial to a unique run directory.
-    Returns the best Config (with best hyperparameters applied).
-    """
-    try:
-        import optuna  # local import; still required when tuning is enabled
-    except Exception as e:
-        raise RuntimeError("Optuna is required when Config.tuning.enabled=True but could not be imported.") from e
-
-    # Put all tuning artifacts under a stable directory keyed by study_name and timestamp.
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    tuning_root = Path(base_cfg.log_dir) / f"optuna_{base_cfg.tuning.study_name}_{ts}"
-    tuning_root.mkdir(parents=True, exist_ok=True)
-
-    def objective(trial: Any) -> float:
-        cfg_trial = _apply_trial_to_cfg(base_cfg, trial)
-
-        # Clobber-proof per-trial run name under tuning_root.
-        run_name = f"{base_cfg.run_name}_trial{trial.number:04d}"
-        run_name = _unique_run_name(run_name, tuning_root)
-        cfg_trial = replace(cfg_trial, log_dir=str(tuning_root), run_name=run_name)
-
-        val = run_train(cfg_trial, return_objective=base_cfg.tuning.objective)
-        assert val is not None
-        return float(val)
-
-    sampler = optuna.samplers.TPESampler(seed=int(base_cfg.tuning.sampler_seed))
-    study = optuna.create_study(direction=str(base_cfg.tuning.direction), study_name=str(base_cfg.tuning.study_name),
-                                sampler=sampler)
-    study.optimize(objective, n_trials=int(base_cfg.tuning.n_trials))
-
-    # Persist a small summary
-    summary = {
-        "study_name": study.study_name,
-        "direction": study.direction.name,
-        "n_trials": len(study.trials),
-        "best_value": float(study.best_value),
-        "best_params": dict(study.best_params),
+    builders = {
+        "MLP": MLPModel,
+        "Flow-map": lambda: FlowMapModel(residual=False),
+        "DeepONet": DeepONetModel,
     }
-    _save_json(tuning_root / "optuna_study_summary.json", summary)
 
-    # Build best config and run a final "best" training job.
-    best_cfg = _apply_trial_to_cfg(base_cfg, study.best_trial)
-    best_run_name = _unique_run_name(f"{base_cfg.run_name}_best", tuning_root)
-    best_cfg = replace(best_cfg, log_dir=str(tuning_root), run_name=best_run_name)
-    run_train(best_cfg)
+    all_metrics: Dict[str, Dict[str, float]] = {}
+    for name, build in builders.items():
+        ckpt_path = RUNS_DIR / name.replace(" ", "_") / "model.pt"
+        if not ckpt_path.exists():
+            print(f"[reeval] WARN: no checkpoint at {ckpt_path}; skipping {name}")
+            continue
+        model = build()
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+        model.to(device)
+        m = evaluate_all_metrics(model, test_loader, stats, device)
+        all_metrics[name] = m
+        paper = PAPER_TABLE2.get(name, float("nan"))
+        print(
+            f"[reeval] {name:<20s}  mse_z={m['mse_z']:.3e}  "
+            f"log10_mae_phys={m['log10_mae_phys']:.3e}  "
+            f"hybrid={m['hybrid']:.3e}  paper={paper:.3e}"
+        )
 
-    return best_cfg
+    write_reeval_outputs(all_metrics)
 
+    # Identify which metric best matches paper Table 2 (smallest mean relative error).
+    if all_metrics and all(arch in all_metrics for arch in PAPER_TABLE2):
+        best_key = None
+        best_score = float("inf")
+        for k in REEVAL_METRIC_KEYS:
+            rel = [
+                abs(all_metrics[arch][k] - PAPER_TABLE2[arch]) / PAPER_TABLE2[arch]
+                for arch in PAPER_TABLE2
+            ]
+            score = sum(rel) / len(rel)
+            print(f"[reeval] mean |rel err| vs paper Table 2 under '{k}': {score:.3f}")
+            if score < best_score:
+                best_score = score
+                best_key = k
+        print(f"[reeval] best-matching metric for paper Table 2: '{best_key}' (mean rel err {best_score:.3f})")
 
-# -----------------------------
-# Evaluation helpers (N-jump fractional errors)
-# -----------------------------
-def _denorm_mlp_dlog(y_norm: jnp.ndarray, norm: NormStatsJax) -> jnp.ndarray:
-    # y_norm: normalized Δlog10(y) [B,3] -> Δlog10(y)
-    return y_norm * jnp.clip(norm.out_std_mlp, norm.min_std, jnp.inf) + norm.out_mean_mlp
-
-
-def _denorm_deeponet_logy(y_norm: jnp.ndarray, norm: NormStatsJax) -> jnp.ndarray:
-    # y_norm: normalized log10(y_next) [B,3] -> log10(y_next)
-    return y_norm * jnp.clip(norm.out_std_deeponet, norm.min_std, jnp.inf) + norm.out_mean_deeponet
-
-
-def _flowmap_step_mlp(
-        params: Any,
-        cache: SplitCache,
-        norm: NormStatsJax,
-        act: Callable[[jnp.ndarray], jnp.ndarray],
-        traj_idx: jnp.ndarray,
-        step_idx: jnp.ndarray,
-        logy_curr: jnp.ndarray,
-) -> jnp.ndarray:
-    """Single MLP flow-map step for evaluation rollouts."""
-    logdt = cache.logdt[traj_idx, step_idx]  # [B]
-
-    x_state = _zscore(logy_curr, norm.state_mean, norm.state_std, norm.min_std)
-    x_dt = _zscore(logdt[:, None], norm.dt_mean, norm.dt_std, norm.min_std)
-    x = jnp.concatenate([x_state, x_dt], axis=-1)  # [B,4]
-
-    y_norm = mlp_apply(params, x, act)
-    dlog = _denorm_mlp_dlog(y_norm, norm)
-    return logy_curr + dlog
+    return 0
 
 
-def _flowmap_step_deeponet(
-        params: Any,
-        cache: SplitCache,
-        norm: NormStatsJax,
-        act: Callable[[jnp.ndarray], jnp.ndarray],
-        traj_idx: jnp.ndarray,
-        step_idx: jnp.ndarray,
-        logy_curr: jnp.ndarray,
-) -> jnp.ndarray:
-    """Single DeepONet flow-map step for evaluation rollouts."""
-    logdt = cache.logdt[traj_idx, step_idx]  # [B]
+MULTISEED_ROOT = HERE / "runs_multiseed"
 
-    x_state = _zscore(logy_curr, norm.state_mean, norm.state_std, norm.min_std)  # [B,3]
-    x_dt = _zscore(logdt[:, None], norm.dt_mean, norm.dt_std, norm.min_std)  # [B,1]
-
-    # Proper DeepONet factorization: branch=state, trunk=dt
-    x_branch = x_state  # [B,3]
-    x_trunk = x_dt  # [B,1]
-    y_norm = deeponet_apply(params, x_branch, x_trunk, act)
-    return _denorm_deeponet_logy(y_norm, norm)
+SPECIES_COLORS = {"x1": "#2E5BBA", "x2": "#D55E00", "x3": "#009E73"}
 
 
-def _logy_to_y_simplex(logy: jnp.ndarray, eps: float) -> jnp.ndarray:
-    y = jnp.power(10.0, logy) - eps
-    y = jnp.clip(y, 0.0, jnp.inf)
-    y = y / jnp.clip(jnp.sum(y, axis=-1, keepdims=True), 1e-30, jnp.inf)
-    return y
+def plot_figure_3_multiseed(
+    seeds: List[int],
+    device: torch.device,
+    aggregated: Dict[str, Dict[str, List[float]]],
+    max_traj: int = None,  # accepted for caller compatibility; unused here
+) -> None:
+    """Single-panel training-curves Fig 3 (square aspect).
 
-
-def compute_n_jump_fractional_errors(
-        cfg: Config,
-        model_type: str,
-        params: Any,
-        cache: SplitCache,
-        norm: NormStatsJax,
-        *,
-        horizons: Sequence[int],
-        n_segments: int,
-        seed: int,
-) -> Dict[str, np.ndarray]:
+    Per-seed thin train curves + bold median train curve + dashed median val
+    curve per architecture. X axis spans the actual number of trained epochs
+    (read from metrics.csv) rather than the EPOCHS constant. Legend reports
+    median test log10_mae_phys with the across-seed range.
     """
-    Compute N-jump fractional errors for evaluation (not used in training).
+    del max_traj  # unused; kept for signature stability
+    if STYLE_PATH.exists():
+        try:
+            plt.style.use(str(STYLE_PATH))
+        except Exception:
+            pass
 
-    For each sampled segment:
-      - pick (traj, start_step) uniformly with start_step <= n_steps - max_horizon
-      - rollout the model for each horizon h in horizons
-      - compare y_pred(t+h) vs y_true(t+h) with fractional error:
-            |y_pred - y_true| / max(y_true, tiny)
+    names = ["MLP", "Flow-map", "DeepONet"]
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+    ax.axvline(WARMUP_EPOCHS, color="gray", linestyle="--", linewidth=1.0, label="End of warmup")
 
-    Returns a dict with:
-      - "horizons": int array [H]
-      - "mean_frac_err": float array [H, 3] (per species)
-      - "mean_frac_err_all": float array [H] (species-mean)
-    """
-    if len(horizons) < 1:
-        raise ValueError("horizons must be non-empty.")
-    max_h = int(max(int(h) for h in horizons))
-    if max_h < 1:
-        raise ValueError("All horizons must be >= 1.")
+    max_epoch_seen = 0
+    using_hybrid_y = None  # True if csv has hybrid columns; warn once if not
+    for name in names:
+        train_curves: List[np.ndarray] = []
+        val_curves: List[np.ndarray] = []
+        epochs_arr: np.ndarray = None
+        for seed in seeds:
+            csv_path = MULTISEED_ROOT / f"seed{seed:02d}" / name.replace(" ", "_") / "metrics.csv"
+            if not csv_path.exists():
+                continue
+            ep, tr, va = [], [], []
+            with open(csv_path) as f:
+                header = [h.strip() for h in next(f).strip().split(",")]
+                has_hybrid = "train_hybrid" in header and "val_hybrid" in header
+                if using_hybrid_y is None:
+                    using_hybrid_y = has_hybrid
+                    if not has_hybrid:
+                        print(f"[fig] WARN: {csv_path.name} has no train_hybrid/val_hybrid; falling back to mse_z on y-axis")
+                if has_hybrid:
+                    # Derive log10_mae_phys per epoch from hybrid = log10_mae + 0.5*mse_z.
+                    # Plotting log10_mae directly keeps the y-axis consistent with the
+                    # legend (test log10-MAE) and with paper Table 2.
+                    i_hyb_tr = header.index("train_hybrid")
+                    i_hyb_va = header.index("val_hybrid")
+                    i_mse_tr = header.index("train_mse_z")
+                    i_mse_va = header.index("val_mse_z")
+                else:
+                    i_tr, i_va = header.index("train_mse_z"), header.index("val_mse_z")
+                for line in f:
+                    parts = line.strip().split(",")
+                    ep.append(int(parts[0]))
+                    if has_hybrid:
+                        tr.append(float(parts[i_hyb_tr]) - 0.5 * float(parts[i_mse_tr]))
+                        va.append(float(parts[i_hyb_va]) - 0.5 * float(parts[i_mse_va]))
+                    else:
+                        tr.append(float(parts[i_tr]))
+                        va.append(float(parts[i_va]))
+            epochs_arr = np.array(ep)
+            train_curves.append(np.array(tr))
+            val_curves.append(np.array(va))
+        if not train_curves:
+            continue
 
-    n_traj = int(cache.logy.shape[0])
-    n_steps = int(cache.logdt.shape[1])
+        color = ARCH_COLORS.get(name, None)
+        mae_vals = np.array(aggregated.get(name, {}).get("log10_mae_phys", []), dtype=float)
+        if mae_vals.size:
+            mae_str = f"{np.median(mae_vals):.2e}"
+        else:
+            mae_str = "n/a"
+        lab = f"{name}: test loss = {mae_str}"
 
-    # logdt has length n_steps (T), while logy has length n_steps+1 (T+1),
-    # so horizon h can be as large as n_steps (starting only at step 0).
-    if max_h > n_steps:
-        raise ValueError(f"Max horizon {max_h} exceeds available steps {n_steps}.")
+        train_arr = np.stack(train_curves)
+        val_arr = np.stack(val_curves)
+        train_med = np.median(train_arr, axis=0)
+        val_med = np.median(val_arr, axis=0)
+        ax.plot(epochs_arr, train_med, color=color, linestyle="-", linewidth=1.8, label=lab)
+        ax.plot(epochs_arr, val_med, color=color, linestyle="--", linewidth=1.1, alpha=0.85)
+        max_epoch_seen = max(max_epoch_seen, int(epochs_arr.max()))
 
-    act = get_activation(cfg.activation)
-    tiny = 1e-30
-
-    key = jax.random.PRNGKey(int(seed))
-    k1, k2 = jax.random.split(key, 2)
-    traj_idx = jax.random.randint(k1, (int(n_segments),), 0, n_traj)
-    max_start = n_steps - max_h
-    if max_start < 0:
-        raise ValueError(f"Invalid max_start={max_start} for n_steps={n_steps} and max_h={max_h}.")
-
-    sampling_l = cfg.step_sampling.lower().strip()
-    if sampling_l == "uniform_step":
-        # Inclusive start in [0, max_start]
-        start_idx = jax.random.randint(k2, (int(n_segments),), 0, max_start + 1)
-    elif sampling_l == "log10_time":
-        # Sample log10(midpoint time) uniformly within each trajectory, restricted to valid start indices.
-        logt_rows = cache.logt_mid[traj_idx, : max_start + 1]  # [S, max_start+1]
-        lo = logt_rows[:, 0]
-        hi = logt_rows[:, -1]
-        u = jax.random.uniform(k2, shape=(int(n_segments),), dtype=jnp.float32)
-        logt = lo + u * (hi - lo)
-
-        def _search_row(row: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
-            return jnp.searchsorted(row, x, side="right") - 1
-
-        start_idx = jax.vmap(_search_row)(logt_rows, logt)
-        start_idx = jnp.clip(start_idx, 0, max_start).astype(jnp.int32)
+    ax.set_xlabel("Epoch")
+    if using_hybrid_y:
+        ax.set_ylabel(r"log$_{10}$ mean absolute error")
     else:
-        raise ValueError(f"Unknown step_sampling={cfg.step_sampling!r} (expected 'uniform_step' or 'log10_time').")
+        ax.set_ylabel(r"Per-epoch MSE in z-scored space")
+    ax.set_yscale("log")
+    if max_epoch_seen > 0:
+        ax.set_xlim(0, max_epoch_seen)
+    ax.legend(loc="upper right", fontsize=13, frameon=False)
 
-    def rollout_to_h(traj_i: jnp.ndarray, start_i: jnp.ndarray, h: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        # Initial condition in log space from cached truth
-        logy0 = cache.logy[traj_i, start_i, :][None, :]  # [1,3]
-        traj_b = traj_i[None]
-        logy_curr = logy0
+    fig.tight_layout()
+    fig.savefig(LOCAL_FIG_PATH)
+    print(f"[fig] saved {LOCAL_FIG_PATH}")
+    if PAPER_FIG_PATH.parent.exists():
+        fig.savefig(PAPER_FIG_PATH)
+        print(f"[fig] saved {PAPER_FIG_PATH}")
+    plt.close(fig)
 
-        def body(logy_c: jnp.ndarray, step_off: jnp.ndarray) -> Tuple[jnp.ndarray, None]:
-            step = start_i + step_off
-            if model_type == "mlp":
-                logy_next = _flowmap_step_mlp(params, cache, norm, act, traj_b, step[None], logy_c)
-            elif model_type == "deeponet":
-                logy_next = _flowmap_step_deeponet(params, cache, norm, act, traj_b, step[None], logy_c)
+
+def write_table2_multiseed(
+    aggregated: Dict[str, Dict[str, List[float]]],
+    n_params_by_arch: Dict[str, int],
+) -> None:
+    """Rewrite table2.txt using log10_mae_phys (mean +/- std across seeds)."""
+    with open(TABLE2_PATH, "w") as f:
+        f.write("# Robertson architecture benchmark (multi-seed, paper Table 2 metric)\n")
+        f.write(f"# Metric: log10_mae_phys = mean(|log10(pred) - log10(truth)|) on test set\n")
+        f.write(f"# Reported as mean +/- std across seeds; paper Table 2 in last column.\n")
+        f.write(
+            f"# {'Architecture':<22} {'Params':>8} {'Test log10-MAE (mean)':>24} "
+            f"{'(std)':>12} {'Paper Table 2':>16}\n"
+        )
+        for arch, met in aggregated.items():
+            vals = np.array(met.get("log10_mae_phys", []), dtype=float)
+            mean = vals.mean() if vals.size else float("nan")
+            std = vals.std(ddof=0) if vals.size else float("nan")
+            params = n_params_by_arch.get(arch, 0)
+            paper = PAPER_TABLE2.get(arch, float("nan"))
+            f.write(
+                f"{arch:<22} {params:>8,} {mean:>24.4e} {std:>12.2e} {paper:>16.4e}\n"
+            )
+    print(f"[table] saved {TABLE2_PATH}")
+
+
+def write_multiseed_summary(
+    aggregated: Dict[str, Dict[str, List[float]]], seeds: List[int],
+) -> None:
+    MULTISEED_ROOT.mkdir(parents=True, exist_ok=True)
+    summary_csv = MULTISEED_ROOT / "summary.csv"
+    summary_md = MULTISEED_ROOT / "summary.md"
+
+    keys = REEVAL_METRIC_KEYS
+
+    with open(summary_csv, "w") as f:
+        head = ["arch"]
+        for k in keys:
+            head += [f"{k}_mean", f"{k}_std"]
+        head.append("paper_table2")
+        f.write(",".join(head) + "\n")
+        for arch, met in aggregated.items():
+            row = [arch]
+            for k in keys:
+                vals = np.array(met.get(k, []), dtype=float)
+                if vals.size:
+                    row += [f"{vals.mean():.6e}", f"{vals.std(ddof=0):.6e}"]
+                else:
+                    row += ["nan", "nan"]
+            row.append(f"{PAPER_TABLE2.get(arch, float('nan')):.6e}")
+            f.write(",".join(row) + "\n")
+
+    with open(summary_md, "w") as f:
+        f.write(f"# Multi-seed Robertson benchmark (seeds: {seeds})\n\n")
+        f.write("Values: mean +/- std across seeds. `paper` = paper Table 2 \"Test Set MSE Loss\".\n\n")
+        head = ["arch"] + keys + ["paper"]
+        f.write("| " + " | ".join(head) + " |\n|" + "|".join(["---"] * len(head)) + "|\n")
+        for arch, met in aggregated.items():
+            row = [arch]
+            for k in keys:
+                vals = np.array(met.get(k, []), dtype=float)
+                if vals.size:
+                    row.append(f"{vals.mean():.3e} +/- {vals.std(ddof=0):.2e}")
+                else:
+                    row.append("n/a")
+            row.append(f"{PAPER_TABLE2.get(arch, float('nan')):.3e}")
+            f.write("| " + " | ".join(row) + " |\n")
+
+        f.write("\n## Per-seed log10_mae_phys (test set)\n\n")
+        f.write("| arch | " + " | ".join(f"seed {s}" for s in seeds) + " |\n")
+        f.write("|" + "|".join(["---"] * (1 + len(seeds))) + "|\n")
+        for arch, met in aggregated.items():
+            vals = met.get("log10_mae_phys", [])
+            cells = [f"{v:.3e}" for v in vals]
+            f.write(f"| {arch} | " + " | ".join(cells) + " |\n")
+
+    print(f"[multiseed] wrote {summary_csv}")
+    print(f"[multiseed] wrote {summary_md}")
+
+
+def multiseed_main(seeds: List[int], device: torch.device, max_traj: int = None) -> int:
+    MULTISEED_ROOT.mkdir(parents=True, exist_ok=True)
+    data = generate_or_load_data()
+    if max_traj is not None and max_traj < data["p1"].shape[0]:
+        for k in ("p1", "p2", "p3"):
+            data[k] = data[k][:max_traj]
+        data["ys"] = data["ys"][:max_traj]
+        print(f"[data] subsetting to first {max_traj} trajectories")
+    n_total_traj = data["p1"].shape[0]
+
+    builders = {
+        "MLP": MLPModel,
+        "Flow-map": lambda: FlowMapModel(residual=False),
+        "DeepONet": DeepONetModel,
+    }
+    names = list(builders.keys())
+
+    aggregated: Dict[str, Dict[str, List[float]]] = {name: {} for name in names}
+
+    for s_idx, seed in enumerate(seeds):
+        print(f"\n========== Seed {seed} ({s_idx+1}/{len(seeds)}) ==========")
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        train_idx, val_idx, test_idx = trajectory_split(n_total_traj, seed=seed)
+        X_train, Y_train = build_pairs(
+            data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], train_idx,
+        )
+        X_val, Y_val = build_pairs(
+            data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], val_idx,
+        )
+        X_test, Y_test = build_pairs(
+            data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], test_idx,
+        )
+        stats = compute_stats(X_train, Y_train)
+        Xtr, Ytr = apply_norm(X_train, Y_train, stats)
+        Xva, Yva = apply_norm(X_val, Y_val, stats)
+        Xte, Yte = apply_norm(X_test, Y_test, stats)
+
+        def make_loader(X: np.ndarray, Y: np.ndarray, shuffle: bool) -> DataLoader:
+            ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(Y).float())
+            return DataLoader(
+                ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=0,
+                pin_memory=(device.type == "cuda"), drop_last=shuffle,
+            )
+
+        train_loader = make_loader(Xtr, Ytr, shuffle=True)
+        val_loader = make_loader(Xva, Yva, shuffle=False)
+        test_loader = make_loader(Xte, Yte, shuffle=False)
+
+        for name in names:
+            out_dir = MULTISEED_ROOT / f"seed{seed:02d}" / name.replace(" ", "_")
+            ckpt = out_dir / "model.pt"
+            if ckpt.exists():
+                print(f"[multiseed] seed={seed} {name}: existing checkpoint found at {ckpt}; skipping training")
             else:
-                raise ValueError(f"Unknown model_type: {model_type}")
-            return logy_next, None
+                torch.manual_seed(seed)
+                model = builders[name]()
+                xavier_init_(model)
+                if hasattr(model, "post_init_reset"):
+                    model.post_init_reset()
+                train_one_model(name, model, train_loader, val_loader, test_loader, stats, device, out_dir)
 
-        step_offsets = jnp.arange(h, dtype=jnp.int32)
-        logy_pred, _ = jax.lax.scan(body, logy_curr, step_offsets)
+            model_eval = builders[name]()
+            model_eval.load_state_dict(torch.load(ckpt, map_location=device))
+            model_eval.to(device)
+            metrics = evaluate_all_metrics(model_eval, test_loader, stats, device)
+            for k, v in metrics.items():
+                aggregated[name].setdefault(k, []).append(v)
+            with open(out_dir / "metrics_all.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+            print(
+                f"[multiseed] seed={seed} {name:<20s}  "
+                f"log10_mae_phys={metrics['log10_mae_phys']:.3e}  "
+                f"mse_z={metrics['mse_z']:.3e}"
+            )
 
-        logy_true = cache.logy[traj_i, start_i + h, :][None, :]  # [1,3]
-        y_pred = _logy_to_y_simplex(logy_pred, float(norm.eps))
-        y_true = _logy_to_y_simplex(logy_true, float(norm.eps))
-        frac = jnp.abs(y_pred - y_true) / jnp.clip(y_true, tiny, jnp.inf)
-        return frac[0], jnp.mean(frac)
+        # Write running summary after each seed in case the job is interrupted.
+        write_multiseed_summary(aggregated, seeds[: s_idx + 1])
 
-    # Vectorize over segments for each horizon.
-    def per_horizon(h: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        frac_species, frac_all = jax.vmap(lambda ti, si: rollout_to_h(ti, si, h))(traj_idx, start_idx)
-        return jnp.mean(frac_species, axis=0), jnp.mean(frac_all, axis=0)
+    n_params_by_arch = {name: count_params(builders[name]()) for name in names}
+    write_table2_multiseed(aggregated, n_params_by_arch)
+    try:
+        plot_figure_3_multiseed(seeds, device, aggregated, max_traj=max_traj)
+    except Exception as e:
+        print(f"[fig] WARN: figure generation failed: {e!r}")
 
-    mean_species_list = []
-    mean_all_list = []
-    for h in horizons:
-        ms, ma = per_horizon(int(h))
-        mean_species_list.append(ms)
-        mean_all_list.append(ma)
+    return 0
 
-    mean_species = jnp.stack(mean_species_list, axis=0)
-    mean_all = jnp.stack(mean_all_list, axis=0)
 
-    return {
-        "horizons": np.asarray(list(horizons), dtype=np.int32),
-        "mean_frac_err": np.asarray(mean_species),
-        "mean_frac_err_all": np.asarray(mean_all),
+def load_existing_history(name: str) -> Dict:
+    out_dir = RUNS_DIR / name.replace(" ", "_")
+    csv_path = out_dir / "metrics.csv"
+    summary_path = out_dir / "summary.json"
+    if not csv_path.exists() or not summary_path.exists():
+        raise FileNotFoundError(f"No saved run for '{name}'. Train first.")
+    with open(summary_path) as f:
+        meta = json.load(f)
+    history: Dict[str, List[float]] = {
+        "epoch": [], "train_mse_z": [], "val_mse_z": [],
+        "train_hybrid": [], "val_hybrid": [], "lr": [],
     }
+    with open(csv_path) as f:
+        header = [h.strip() for h in next(f).strip().split(",")]
+        idx = {col: header.index(col) for col in header}
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) < len(header):
+                continue
+            history["epoch"].append(int(parts[idx["epoch"]]))
+            history["train_mse_z"].append(float(parts[idx["train_mse_z"]]))
+            history["val_mse_z"].append(float(parts[idx["val_mse_z"]]))
+            history["lr"].append(float(parts[idx["lr"]]))
+            if "train_hybrid" in idx:
+                history["train_hybrid"].append(float(parts[idx["train_hybrid"]]))
+                history["val_hybrid"].append(float(parts[idx["val_hybrid"]]))
+    return {"name": name, "n_params": meta["n_params"], "test_mse_z": meta["test_mse_z"], "history": history}
 
 
-# -----------------------------
-# Entry point
-# -----------------------------
-def main() -> None:
-    if CONFIG.tuning.enabled:
-        run_optuna_tuning(CONFIG)
+# ====================================================================
+# Main
+# ====================================================================
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--skip-train", action="store_true", help="Skip training; plot from existing runs/")
+    parser.add_argument(
+        "--reeval", action="store_true",
+        help="Re-evaluate existing checkpoints under all candidate Test-MSE definitions; no training",
+    )
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=None,
+        help="Multi-seed sweep: train all 4 archs once per listed seed. Writes runs_multiseed/.",
+    )
+    parser.add_argument(
+        "--max-traj", type=int, default=None,
+        help="Subset to the first N trajectories from the cache (no regen). For faster sweeps.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override the training-epoch count (default 250).",
+    )
+    args = parser.parse_args()
+
+    global EPOCHS
+    if args.epochs is not None:
+        EPOCHS = args.epochs
+        print(f"[config] EPOCHS overridden -> {EPOCHS}")
+
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     else:
-        run_train(CONFIG)
+        device = torch.device(args.device)
+
+    names = ["MLP", "Flow-map", "DeepONet"]
+
+    if args.reeval:
+        return reeval_existing_checkpoints(device)
+
+    if args.seeds is not None:
+        return multiseed_main(args.seeds, device, max_traj=args.max_traj)
+
+    if args.skip_train:
+        results = [load_existing_history(n) for n in names]
+        plot_figure_3(results)
+        write_table2(results)
+        return 0
+
+    RUNS_DIR.mkdir(exist_ok=True)
+    data = generate_or_load_data()
+    n_total = data["p1"].shape[0]
+    train_idx, val_idx, test_idx = trajectory_split(n_total)
+    print(f"split: train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)} trajectories")
+
+    print("[pairs] building (X, Y) pairs ...")
+    X_train, Y_train = build_pairs(data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], train_idx)
+    X_val,   Y_val   = build_pairs(data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], val_idx)
+    X_test,  Y_test  = build_pairs(data["p1"], data["p2"], data["p3"], data["t_eval"], data["ys"], test_idx)
+    stats = compute_stats(X_train, Y_train)
+    Xtr, Ytr = apply_norm(X_train, Y_train, stats)
+    Xva, Yva = apply_norm(X_val, Y_val, stats)
+    Xte, Yte = apply_norm(X_test, Y_test, stats)
+    print(f"[pairs] train={Xtr.shape[0]:,}  val={Xva.shape[0]:,}  test={Xte.shape[0]:,}")
+
+    def make_loader(X: np.ndarray, Y: np.ndarray, shuffle: bool) -> DataLoader:
+        ds = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(Y).float())
+        return DataLoader(
+            ds,
+            batch_size=BATCH_SIZE,
+            shuffle=shuffle,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+            drop_last=shuffle,
+        )
+
+    train_loader = make_loader(Xtr, Ytr, shuffle=True)
+    val_loader = make_loader(Xva, Yva, shuffle=False)
+    test_loader = make_loader(Xte, Yte, shuffle=False)
+
+    builders = {
+        "MLP": MLPModel,
+        "Flow-map": lambda: FlowMapModel(residual=False),
+        "DeepONet": DeepONetModel,
+    }
+    results: List[Dict] = []
+    for name in names:
+        torch.manual_seed(SEED)  # reset for reproducible init across architectures
+        model = builders[name]()
+        xavier_init_(model)
+        if hasattr(model, "post_init_reset"):
+            model.post_init_reset()
+        out_dir = RUNS_DIR / name.replace(" ", "_")
+        results.append(train_one_model(name, model, train_loader, val_loader, test_loader, stats, device, out_dir))
+
+    plot_figure_3(results)
+    write_table2(results)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    mp.set_start_method("spawn", force=True)
+    sys.exit(main())
